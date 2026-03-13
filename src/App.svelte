@@ -7,13 +7,13 @@
     isAutostartEnabled,
     listClipboardHistory,
     listTransferJobs,
-    onClipboardHistoryUpdated,
     onClipboardError,
+    onClipboardHistoryUpdated,
     onDevicesUpdated,
     onSyncStatusChanged,
     onTransferJobsUpdated,
-    openCacheDirectory,
     onTransferReady,
+    openCacheDirectory,
     placeReceivedTransferOnClipboard,
     restoreClipboardHistoryEntry,
     setActiveDevice,
@@ -23,11 +23,31 @@
   } from './lib/api'
   import { getMessages, normalizeLanguage } from './lib/i18n'
   import type { AppStateSnapshot, ClipboardHistoryEntry, TransferJob } from './lib/types'
+  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+  import { Badge } from '$lib/components/ui/badge'
+  import { Button } from '$lib/components/ui/button'
   import {
-    isPermissionGranted,
-    requestPermission,
-    sendNotification,
-  } from '@tauri-apps/plugin-notification'
+    Card,
+    CardContent,
+    CardDescription,
+    CardHeader,
+    CardTitle,
+  } from '$lib/components/ui/card'
+  import { Input } from '$lib/components/ui/input'
+  import { Progress } from '$lib/components/ui/progress'
+  import { ScrollArea } from '$lib/components/ui/scroll-area'
+  import { Separator } from '$lib/components/ui/separator'
+  import { Switch } from '$lib/components/ui/switch'
+  import {
+    ClipboardList,
+    Copy,
+    FolderOpen,
+    Image,
+    Link2,
+    Search,
+    Send,
+    Type,
+  } from '@lucide/svelte'
 
   let snapshot: AppStateSnapshot | null = null
   let transferJobs: TransferJob[] = []
@@ -216,6 +236,18 @@
     }).format(new Date(value))
   }
 
+  function historyPreview(entry: ClipboardHistoryEntry) {
+    if (entry.previewText) return entry.previewText
+    if (entry.topLevelNames.length > 0) return entry.topLevelNames.join(', ')
+    return formatBytes(entry.size)
+  }
+
+  function statusVariant(state?: string | null): 'default' | 'secondary' | 'outline' {
+    if (state === 'connected' || state === 'syncing') return 'default'
+    if (state === 'error') return 'outline'
+    return 'secondary'
+  }
+
   onMount(() => {
     let disposed = false
     void refresh()
@@ -251,212 +283,274 @@
 </script>
 
 {#if snapshot}
-  <main class="shell">
-    <section class="toolbox glass">
-      <header class="topbar">
-        <div class="title-stack">
-          <p class="eyebrow">{copy.title}</p>
-          <input
-            class="device-name-input"
-            disabled={settingsBusy}
-            on:change={(event) =>
-              patchSettings({ deviceName: (event.currentTarget as HTMLInputElement).value })}
-            spellcheck="false"
-            type="text"
-            value={snapshot.settings.deviceName}
-          />
-        </div>
-        <div class={`status-pill ${syncStatus?.state ?? 'idle'}`}>
-          <strong>{copy.syncState(syncStatus?.state ?? 'idle')}</strong>
-          <small>{syncStatus?.message ?? ''}</small>
-        </div>
-      </header>
-
-      {#if errorBanner}
-        <div class="banner">{errorBanner}</div>
-      {/if}
-
-      <section class="card glass inner">
-        <div class="section-head">
-          <span>{copy.currentPair}</span>
-        </div>
-        {#if activeDevice}
-          <article class="pair-card">
-            <div>
-              <strong>{activeDevice.name}</strong>
-              <small>{activeDevice.platform} · {activeDevice.isOnline ? copy.online : copy.offline}</small>
+  <main class="min-h-screen bg-muted/40 p-3 text-sm">
+    <div class="mx-auto flex max-w-[430px] flex-col gap-3">
+      <Card class="shadow-sm">
+        <CardHeader class="gap-3 pb-3">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0 flex-1 space-y-2">
+              <div class="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                <Link2 class="size-3.5" />
+                <span>{copy.title}</span>
+              </div>
+              <Input
+                class="h-9 text-sm font-semibold"
+                disabled={settingsBusy}
+                on:change={(event) =>
+                  patchSettings({ deviceName: (event.target as HTMLInputElement).value })}
+                spellcheck="false"
+                value={snapshot.settings.deviceName}
+              />
             </div>
-            <span class="pill success">{copy.activeNow}</span>
-          </article>
-        {:else}
-          <article class="empty-card">
-            <strong>{copy.noActivePair}</strong>
-            <small>{copy.noActivePairHint}</small>
-          </article>
-        {/if}
-      </section>
-
-      <section class="card glass inner">
-        <div class="section-head">
-          <span>{copy.nearby}</span>
-        </div>
-        <div class="device-list">
-          {#if nearbyDevices.length === 0}
-            <article class="empty-card compact">
-              <strong>{copy.waitingDevices}</strong>
-              <small>{copy.waitingDevicesHint}</small>
-            </article>
-          {:else}
-            {#each nearbyDevices as device}
-              <article class="device-row">
-                <div class="device-meta">
-                  <strong>{device.name}</strong>
-                  <small>{device.platform}</small>
-                </div>
-                <button class="primary compact" on:click={() => pairDevice(device.deviceId)} type="button">
-                  {copy.makeActive}
-                </button>
-              </article>
-            {/each}
+            <div class="flex max-w-36 flex-col items-end gap-1 text-right">
+              <Badge variant={statusVariant(syncStatus?.state)}>{copy.syncState(syncStatus?.state ?? 'idle')}</Badge>
+              <p class="text-[11px] leading-4 text-muted-foreground">
+                {syncStatus?.message ?? ''}
+              </p>
+            </div>
+          </div>
+          {#if errorBanner}
+            <div class="rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {errorBanner}
+            </div>
           {/if}
-        </div>
-      </section>
+        </CardHeader>
 
-      <section class="card glass inner">
-        <div class="section-head">
-          <span>{copy.transfers}</span>
-        </div>
-        <div class="transfer-list">
-          {#if visibleTransferJobs.length === 0}
-            <article class="empty-card compact">
-              <strong>{copy.noTransfers}</strong>
-            </article>
-          {:else}
-            {#each visibleTransferJobs as job}
-              <article class:ready={job.stage === 'ready' && job.readyActionState === 'pendingPrompt'} class="transfer-row">
-                <div class="transfer-top">
-                  <div>
-                    <strong>{job.displayName}</strong>
-                    <small>{copy.transferState(job.stage, job.direction)}</small>
+        <CardContent class="space-y-3">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <div>
+                <CardTitle>{copy.currentPair}</CardTitle>
+                <CardDescription class="mt-1">
+                  {activeDevice ? copy.activeNow : copy.noActivePairHint}
+                </CardDescription>
+              </div>
+              {#if activeDevice}
+                <Badge variant="secondary">{copy.activeNow}</Badge>
+              {/if}
+            </div>
+
+            <div class="rounded-lg border bg-background px-3 py-2">
+              {#if activeDevice}
+                <div class="flex items-center justify-between gap-3">
+                  <div class="min-w-0">
+                    <div class="truncate font-medium">{activeDevice.name}</div>
+                    <div class="text-xs text-muted-foreground">
+                      {activeDevice.platform} · {activeDevice.isOnline ? copy.online : copy.offline}
+                    </div>
                   </div>
-                  <small>{copy.transferSummary(job.completedEntries, job.totalEntries)}</small>
+                  <Badge variant="outline">{activeDevice.isOnline ? copy.online : copy.offline}</Badge>
                 </div>
-
-                <div class="meter">
-                  <div class="meter-bar" style={`width: ${progress(job)}%`}></div>
+              {:else}
+                <div class="text-xs text-muted-foreground">
+                  {copy.noActivePair}
                 </div>
+              {/if}
+            </div>
+          </div>
 
-                <div class="transfer-meta">
-                  <small>{formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)}</small>
-                  {#if job.warningMessage}
-                    <small>{job.warningMessage}</small>
-                  {:else if job.errorMessage}
-                    <small>{job.errorMessage}</small>
-                  {:else if job.stage === 'ready' && job.direction === 'inbound'}
-                    <small>{copy.readyToPaste}</small>
-                  {:else if job.stage === 'ready'}
-                    <small>{copy.hiddenReadyState(job.readyActionState)}</small>
+          <Separator />
+
+          <div class="space-y-2">
+            <div class="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+              <Search class="size-3.5" />
+              <span>{copy.nearby}</span>
+            </div>
+
+            {#if nearbyDevices.length === 0}
+              <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
+                <div class="font-medium text-foreground">{copy.waitingDevices}</div>
+                <div class="mt-1">{copy.waitingDevicesHint}</div>
+              </div>
+            {:else}
+              <div class="space-y-2">
+                {#each nearbyDevices as device}
+                  <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-2">
+                    <div class="min-w-0">
+                      <div class="truncate font-medium">{device.name}</div>
+                      <div class="text-xs text-muted-foreground">{device.platform}</div>
+                    </div>
+                    <Button on:click={() => pairDevice(device.deviceId)} size="sm" variant="secondary">
+                      {copy.makeActive}
+                    </Button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card class="shadow-sm">
+        <CardHeader class="pb-3">
+          <div class="flex items-center justify-between gap-3">
+            <div class="flex items-center gap-2">
+              <Send class="size-4 text-muted-foreground" />
+              <CardTitle>{copy.transfers}</CardTitle>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent class="pt-0">
+          {#if visibleTransferJobs.length === 0}
+            <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
+              {copy.noTransfers}
+            </div>
+          {:else}
+            <ScrollArea class="max-h-64 space-y-2 pr-1">
+              {#each visibleTransferJobs as job}
+                <div class="space-y-2 rounded-lg border bg-background px-3 py-3">
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <div class="truncate font-medium">{job.displayName}</div>
+                      <div class="text-xs text-muted-foreground">
+                        {copy.transferState(job.stage, job.direction)}
+                      </div>
+                    </div>
+                    <div class="shrink-0 text-[11px] text-muted-foreground">
+                      {copy.transferSummary(job.completedEntries, job.totalEntries)}
+                    </div>
+                  </div>
+
+                  <Progress value={progress(job)} />
+
+                  <div class="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
+                    <span>{formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)}</span>
+                    <span>
+                      {#if job.warningMessage}
+                        {job.warningMessage}
+                      {:else if job.errorMessage}
+                        {job.errorMessage}
+                      {:else if job.stage === 'ready' && job.direction === 'inbound'}
+                        {copy.readyToPaste}
+                      {:else if job.stage === 'ready'}
+                        {copy.hiddenReadyState(job.readyActionState)}
+                      {/if}
+                    </span>
+                  </div>
+
+                  {#if job.stage === 'ready' && job.direction === 'inbound' && job.readyActionState === 'pendingPrompt'}
+                    <div class="flex items-center justify-end gap-2">
+                      <Button
+                        disabled={busyTransferId === job.transferId}
+                        on:click={() => placeTransfer(job)}
+                        size="sm"
+                      >
+                        {copy.placeOnClipboard}
+                      </Button>
+                      <Button
+                        disabled={busyTransferId === job.transferId}
+                        on:click={() => dismissTransfer(job)}
+                        size="sm"
+                        variant="outline"
+                      >
+                        {copy.dismiss}
+                      </Button>
+                    </div>
+                    <p class="text-[11px] text-muted-foreground">{copy.replaceWarning}</p>
+                  {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
+                    <div class="flex justify-end">
+                      <Button
+                        disabled={busyTransferId === job.transferId}
+                        on:click={() => cancelTransfer(job)}
+                        size="sm"
+                        variant="outline"
+                      >
+                        {copy.cancel}
+                      </Button>
+                    </div>
                   {/if}
                 </div>
-
-                {#if job.stage === 'ready' && job.direction === 'inbound' && job.readyActionState === 'pendingPrompt'}
-                  <div class="action-row">
-                    <button
-                      class="primary"
-                      disabled={busyTransferId === job.transferId}
-                      on:click={() => placeTransfer(job)}
-                      type="button"
-                    >
-                      {copy.placeOnClipboard}
-                    </button>
-                    <button
-                      class="ghost"
-                      disabled={busyTransferId === job.transferId}
-                      on:click={() => dismissTransfer(job)}
-                      type="button"
-                    >
-                      {copy.dismiss}
-                    </button>
-                  </div>
-                  <small class="warning">{copy.replaceWarning}</small>
-                {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
-                  <div class="action-row">
-                    <button
-                      class="ghost"
-                      disabled={busyTransferId === job.transferId}
-                      on:click={() => cancelTransfer(job)}
-                      type="button"
-                    >
-                      {copy.cancel}
-                    </button>
-                  </div>
-                {/if}
-              </article>
-            {/each}
+              {/each}
+            </ScrollArea>
           {/if}
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
-      <section class="card glass inner">
-        <div class="section-head with-action">
-          <span>{copy.clipboardHistory}</span>
-          <button class="ghost compact" on:click={openCache} type="button">
-            {copy.openCacheDirectory}
-          </button>
-        </div>
-        <div class="history-list">
+      <Card class="shadow-sm">
+        <CardHeader class="pb-3">
+          <div class="flex items-center justify-between gap-3">
+            <div class="flex items-center gap-2">
+              <ClipboardList class="size-4 text-muted-foreground" />
+              <CardTitle>{copy.clipboardHistory}</CardTitle>
+            </div>
+            <Button on:click={openCache} size="sm" variant="ghost">
+              <FolderOpen class="size-4" />
+              {copy.openCacheDirectory}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent class="pt-0">
           {#if clipboardHistory.length === 0}
-            <article class="empty-card compact">
-              <strong>{copy.noClipboardHistory}</strong>
-            </article>
+            <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
+              {copy.noClipboardHistory}
+            </div>
           {:else}
-            {#each clipboardHistory as entry}
-              <article class="history-row">
-                <div class="history-main">
-                  <div>
-                    <strong>{entry.displayName}</strong>
-                    <small>
-                      {copy.historyKind(entry.kind, entry.fileCount)} · {copy.historySource(entry.source)}
-                    </small>
+            <ScrollArea class="max-h-72 space-y-2 pr-1">
+              {#each clipboardHistory as entry}
+                <div class="space-y-2 rounded-lg border bg-background px-3 py-3">
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="flex min-w-0 items-start gap-2">
+                      <div class="mt-0.5 text-muted-foreground">
+                        {#if entry.kind === 'text'}
+                          <Type class="size-4" />
+                        {:else if entry.kind === 'image'}
+                          <Image class="size-4" />
+                        {:else}
+                          <ClipboardList class="size-4" />
+                        {/if}
+                      </div>
+                      <div class="min-w-0">
+                        <div class="truncate font-medium">{entry.displayName}</div>
+                        <div class="text-xs text-muted-foreground">
+                          {copy.historyKind(entry.kind, entry.fileCount)} · {copy.historySource(entry.source)}
+                        </div>
+                      </div>
+                    </div>
+                    <div class="shrink-0 text-[11px] text-muted-foreground">{formatTime(entry.createdAt)}</div>
                   </div>
-                  <small>{formatTime(entry.createdAt)}</small>
-                </div>
-                {#if entry.previewText}
-                  <p class="history-preview">{entry.previewText}</p>
-                {:else if entry.topLevelNames.length > 0}
-                  <p class="history-preview">{entry.topLevelNames.join(', ')}</p>
-                {/if}
-                <div class="action-row">
-                  <button
-                    class="ghost compact"
-                    disabled={busyHistoryId === entry.entryId}
-                    on:click={() => restoreHistory(entry)}
-                    type="button"
-                  >
-                    {copy.restoreHistory}
-                  </button>
-                </div>
-              </article>
-            {/each}
-          {/if}
-        </div>
-      </section>
 
-      <footer class="card glass inner footer">
-        <label class="toggle-row">
-          <span>{copy.syncEnabled}</span>
-          <input
+                  <p class="line-clamp-2 text-xs leading-5 text-muted-foreground">
+                    {historyPreview(entry)}
+                  </p>
+
+                  <div class="flex justify-end">
+                    <Button
+                      disabled={busyHistoryId === entry.entryId}
+                      on:click={() => restoreHistory(entry)}
+                      size="sm"
+                      variant="outline"
+                    >
+                      <Copy class="size-3.5" />
+                      {copy.restoreHistory}
+                    </Button>
+                  </div>
+                </div>
+              {/each}
+            </ScrollArea>
+          {/if}
+        </CardContent>
+      </Card>
+
+      <Card class="shadow-sm">
+        <CardContent class="flex items-center justify-between gap-3 py-3">
+          <div>
+            <div class="font-medium">{copy.syncEnabled}</div>
+            <div class="text-xs text-muted-foreground">{syncStatus?.message ?? ''}</div>
+          </div>
+          <Switch
             checked={snapshot.settings.syncEnabled}
             disabled={settingsBusy}
-            on:change={(event) => toggleClipboardSync((event.currentTarget as HTMLInputElement).checked)}
-            type="checkbox"
+            on:change={(event) =>
+              toggleClipboardSync((event.target as HTMLInputElement).checked)}
           />
-        </label>
-      </footer>
-    </section>
+        </CardContent>
+      </Card>
+    </div>
   </main>
 {:else}
-  <main class="loading">
-    <div class="glass loader">RelayClip</div>
+  <main class="flex min-h-screen items-center justify-center bg-muted/40 p-4">
+    <Card class="w-full max-w-sm shadow-sm">
+      <CardContent class="py-10 text-center text-sm text-muted-foreground">RelayClip</CardContent>
+    </Card>
   </main>
 {/if}

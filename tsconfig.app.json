@@ -5,6 +5,11 @@
     "target": "ES2023",
     "useDefineForClassFields": true,
     "module": "ESNext",
+    "baseUrl": ".",
+    "paths": {
+      "$lib": ["src/lib"],
+      "$lib/*": ["src/lib/*"]
+    },
     "types": ["svelte", "vite/client"],
     "noEmit": true,
     /**

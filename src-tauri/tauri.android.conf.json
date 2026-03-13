@@ -1,0 +1,12 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "identifier": "com.relayclip.mobile",
+  "bundle": {
+    "shortDescription": "Clipboard relay for Android devices on the same LAN.",
+    "android": {
+      "minSdkVersion": 26,
+      "versionCode": 1
+    }
+  },
+  "version": "2026.3.13"
+}

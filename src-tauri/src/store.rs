@@ -177,6 +177,7 @@ fn default_state() -> Result<PersistentState> {
         settings: AppSettings {
             device_name,
             launch_on_login: true,
+            background_sync_enabled: true,
             discovery_enabled: true,
             sync_enabled: true,
             active_device_id: None,
@@ -200,7 +201,6 @@ fn normalize_state(state: &mut PersistentState) -> Result<()> {
         state.settings.device_name = state.local_device.device_name.clone();
     }
 
-    state.settings.launch_on_login = true;
     state.settings.active_device_id = None;
     state.trusted_devices.clear();
 

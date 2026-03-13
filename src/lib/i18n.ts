@@ -1,8 +1,11 @@
 import type {
   AppLanguage,
+  BackgroundSyncMode,
   ClipboardHistoryKind,
   ClipboardHistorySource,
   ReadyActionState,
+  RuntimePermissionState,
+  RuntimePlatform,
   SyncState,
   TransferDirection,
   TransferStage,
@@ -28,11 +31,31 @@ export interface Messages {
   openCacheDirectory: string
   readyToPaste: string
   placeOnClipboard: string
+  shareExternally: string
+  exportToFiles: string
   dismiss: string
   cancel: string
   syncEnabled: string
+  launchOnLogin: string
+  launchOnLoginHint: string
+  backgroundSync: string
+  backgroundSyncHint: string
+  environment: string
+  permissions: string
+  requestPermissions: string
+  permissionsHint: string
+  notificationsPermission: string
+  localNetworkPermission: string
+  clipboardPermission: string
+  fileAccessPermission: string
+  backgroundSyncPermission: string
+  actionsUnavailable: string
+  mobileLimitedHint: string
   saving: string
   syncState(state: SyncState): string
+  runtimePlatform(platform: RuntimePlatform): string
+  permissionState(state: RuntimePermissionState): string
+  backgroundMode(mode: BackgroundSyncMode, active: boolean): string
   transferState(stage: TransferStage, direction: TransferDirection): string
   transferSummary(done: number, total: number): string
   notificationTitle: string
@@ -63,9 +86,26 @@ const english: Messages = {
   openCacheDirectory: 'Open cache',
   readyToPaste: 'Ready to place on clipboard',
   placeOnClipboard: 'Place on clipboard',
+  shareExternally: 'Share',
+  exportToFiles: 'Export',
   dismiss: 'Dismiss',
   cancel: 'Cancel',
   syncEnabled: 'Clipboard sync',
+  launchOnLogin: 'Launch on login',
+  launchOnLoginHint: 'Desktop only. Keeps RelayClip ready after sign-in.',
+  backgroundSync: 'Background sync',
+  backgroundSyncHint: 'Mobile only. The actual runtime behavior depends on platform policy.',
+  environment: 'Runtime',
+  permissions: 'Permissions',
+  requestPermissions: 'Grant access',
+  permissionsHint: 'Review platform permissions before expecting background discovery or notifications.',
+  notificationsPermission: 'Notifications',
+  localNetworkPermission: 'Local network',
+  clipboardPermission: 'Clipboard',
+  fileAccessPermission: 'Files',
+  backgroundSyncPermission: 'Background sync',
+  actionsUnavailable: 'No supported action is available for this platform yet.',
+  mobileLimitedHint: 'Mobile builds show only the actions that are currently available on the running platform.',
   saving: 'Saving...',
   syncState: (state) =>
     ({
@@ -76,6 +116,33 @@ const english: Messages = {
       paused: 'Paused',
       error: 'Error',
     })[state],
+  runtimePlatform: (platform) =>
+    ({
+      windows: 'Windows',
+      macos: 'macOS',
+      linux: 'Linux',
+      android: 'Android',
+      ios: 'iOS',
+      unknown: 'Unknown',
+    })[platform],
+  permissionState: (state) =>
+    ({
+      granted: 'Granted',
+      denied: 'Denied',
+      prompt: 'Needs prompt',
+      unsupported: 'Unsupported',
+    })[state],
+  backgroundMode: (mode, active) => {
+    const label =
+      ({
+        desktop: 'Desktop runtime',
+        foregroundOnly: 'Foreground only',
+        foregroundService: 'Foreground service',
+        appRefresh: 'App refresh',
+        unsupported: 'Unsupported',
+      })[mode]
+    return active ? `${label} active` : label
+  },
   transferState: (stage, direction) => {
     if (stage === 'ready') {
       return direction === 'inbound' ? 'Downloaded' : 'Sent'
@@ -94,13 +161,13 @@ const english: Messages = {
   },
   transferSummary: (done, total) => `${done}/${total} items`,
   notificationTitle: 'File relay complete',
-  notificationBody: (name) => `${name} is ready to place on the clipboard.`,
+  notificationBody: (name) => `${name} is ready for the next action.`,
   replaceWarning: 'This replaces the current clipboard content.',
   hiddenReadyState: (state) =>
     ({
       pendingPrompt: 'Pending',
       dismissed: 'Dismissed',
-      placed: 'Placed',
+      placed: 'Handled',
     })[state],
   historyKind: (kind, fileCount) =>
     ({
@@ -123,7 +190,7 @@ const chinese: Messages = {
   waitingDevices: '还没有发现其他在线设备',
   waitingDevicesHint: '同一局域网内的设备会自动出现在这里。',
   noActivePair: '还没有配对设备',
-  noActivePairHint: '下方出现在线设备后可直接配对。',
+  noActivePairHint: '下方出现在线设备后可以直接配对。',
   makeActive: '配对',
   activeNow: '已连接',
   online: '在线',
@@ -133,22 +200,66 @@ const chinese: Messages = {
   clipboardHistory: '剪贴板历史',
   noClipboardHistory: '还没有剪贴板历史。',
   restoreHistory: '复制',
-  openCacheDirectory: '打开缓存目录',
-  readyToPaste: '已下载完成，可放入剪贴板',
+  openCacheDirectory: '打开缓存',
+  readyToPaste: '可以放入剪贴板',
   placeOnClipboard: '放入剪贴板',
+  shareExternally: '系统分享',
+  exportToFiles: '导出文件',
   dismiss: '忽略',
   cancel: '取消',
   syncEnabled: '剪贴板同步',
+  launchOnLogin: '开机启动',
+  launchOnLoginHint: '仅桌面端可用，登录后自动准备好 RelayClip。',
+  backgroundSync: '后台同步',
+  backgroundSyncHint: '仅移动端可用，具体表现会受系统策略限制。',
+  environment: '运行环境',
+  permissions: '权限',
+  requestPermissions: '申请权限',
+  permissionsHint: '移动端的发现、通知和后台同步都依赖系统授权。',
+  notificationsPermission: '通知',
+  localNetworkPermission: '本地网络',
+  clipboardPermission: '剪贴板',
+  fileAccessPermission: '文件访问',
+  backgroundSyncPermission: '后台同步',
+  actionsUnavailable: '当前平台还没有可执行的后续动作。',
+  mobileLimitedHint: '移动端会只显示当前平台真正可用的动作。',
   saving: '保存中...',
   syncState: (state) =>
     ({
       idle: '空闲',
-      discovering: '搜索中',
+      discovering: '发现中',
       connected: '已连接',
       syncing: '同步中',
       paused: '已暂停',
-      error: '出错',
+      error: '异常',
     })[state],
+  runtimePlatform: (platform) =>
+    ({
+      windows: 'Windows',
+      macos: 'macOS',
+      linux: 'Linux',
+      android: 'Android',
+      ios: 'iOS',
+      unknown: '未知平台',
+    })[platform],
+  permissionState: (state) =>
+    ({
+      granted: '已授权',
+      denied: '已拒绝',
+      prompt: '待授权',
+      unsupported: '不支持',
+    })[state],
+  backgroundMode: (mode, active) => {
+    const label =
+      ({
+        desktop: '桌面常驻',
+        foregroundOnly: '仅前台',
+        foregroundService: '前台服务',
+        appRefresh: '应用刷新',
+        unsupported: '不支持',
+      })[mode]
+    return active ? `${label}（活跃）` : label
+  },
   transferState: (stage, direction) => {
     if (stage === 'ready') {
       return direction === 'inbound' ? '已下载' : '已发送'
@@ -166,14 +277,14 @@ const chinese: Messages = {
     )[stage]
   },
   transferSummary: (done, total) => `${done}/${total} 项`,
-  notificationTitle: '文件已接力完成',
-  notificationBody: (name) => `${name} 已可放入剪贴板。`,
+  notificationTitle: '文件接力完成',
+  notificationBody: (name) => `${name} 已经可以继续处理。`,
   replaceWarning: '这会替换当前剪贴板内容。',
   hiddenReadyState: (state) =>
     ({
       pendingPrompt: '待处理',
       dismissed: '已忽略',
-      placed: '已放入',
+      placed: '已处理',
     })[state],
   historyKind: (kind, fileCount) =>
     ({

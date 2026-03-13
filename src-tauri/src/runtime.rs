@@ -1,11 +1,13 @@
 use crate::clipboard::{self, ClipboardPacket};
 use crate::discovery::{self, DiscoveryHandle};
 use crate::i18n;
+use crate::mobile_bridge::RuntimeBridge;
 use crate::models::{
-    AppLanguage, AppSettings, AppStateSnapshot, ClipboardHistoryEntry, ClipboardHistoryKind,
-    ClipboardHistorySource, ClipboardPayload, ClipboardPayloadKind, LocalDevice, PersistentState,
-    ReadyActionState, SettingsPatch, SyncState, SyncStatus, TransferDirection, TransferJob,
-    TransferKind, TransferStage, TrustedDevice,
+    AppLanguage, AppSettings, AppStateSnapshot, BackgroundSyncState, ClipboardHistoryEntry,
+    ClipboardHistoryKind, ClipboardHistorySource, ClipboardPayload, ClipboardPayloadKind,
+    LocalDevice, PersistentState, ReadyActionState, RuntimeCapabilities, RuntimePermissions,
+    RuntimePlatform, SettingsPatch, SyncState, SyncStatus, TransferAction, TransferDirection,
+    TransferJob, TransferKind, TransferStage, TrustedDevice,
 };
 use crate::store;
 use crate::transport::{self, ClipboardEnvelope, IncomingTransferOffer};
@@ -55,6 +57,7 @@ pub(crate) struct IncomingTransferPreparation {
 
 struct RuntimeInner {
     app: AppHandle,
+    bridge: RuntimeBridge,
     state_path: PathBuf,
     persistent: RwLock<PersistentState>,
     transfer_jobs: RwLock<Vec<TransferJob>>,
@@ -96,7 +99,7 @@ struct ActiveTarget {
 }
 
 impl RelayRuntime {
-    pub fn new(app: AppHandle) -> Result<Self> {
+    pub fn new(app: AppHandle, bridge: RuntimeBridge) -> Result<Self> {
         let (state_path, persistent) = store::load_or_create()?;
         let mut transfer_jobs = store::load_transfer_jobs(&state_path)?;
         let mut clipboard_history = store::load_clipboard_history(&state_path)?;
@@ -114,6 +117,7 @@ impl RelayRuntime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 app,
+                bridge,
                 state_path,
                 persistent: RwLock::new(persistent),
                 transfer_jobs: RwLock::new(transfer_jobs),
@@ -167,6 +171,28 @@ impl RelayRuntime {
         self.persistent_clone().settings.language
     }
 
+    pub fn runtime_platform(&self) -> RuntimePlatform {
+        self.inner.bridge.platform()
+    }
+
+    pub fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        self.inner.bridge.capabilities()
+    }
+
+    pub fn runtime_permissions(&self) -> RuntimePermissions {
+        self.inner.bridge.permissions()
+    }
+
+    pub fn request_runtime_permissions(&self) -> RuntimePermissions {
+        self.inner.bridge.request_permissions()
+    }
+
+    pub fn background_sync_state(&self) -> BackgroundSyncState {
+        self.inner
+            .bridge
+            .background_sync_state(self.persistent_clone().settings.background_sync_enabled)
+    }
+
     pub fn snapshot(&self) -> Result<AppStateSnapshot> {
         let persistent = self.persistent_clone();
         let mut settings = persistent.settings.clone();
@@ -176,6 +202,9 @@ impl RelayRuntime {
             settings,
             devices: self.collect_devices(&persistent.local_device.device_id),
             sync_status: self.sync_status_clone(),
+            runtime_platform: self.runtime_platform(),
+            capabilities: self.runtime_capabilities(),
+            permissions: self.runtime_permissions(),
         })
     }
 
@@ -197,6 +226,7 @@ impl RelayRuntime {
                 .cmp(&transfer_sort_rank(right))
                 .then(right.started_at.cmp(&left.started_at))
         });
+        self.decorate_transfer_jobs(&mut jobs);
         jobs
     }
 
@@ -271,6 +301,10 @@ impl RelayRuntime {
 
             if let Some(launch_on_login) = patch.launch_on_login {
                 persistent.settings.launch_on_login = launch_on_login;
+            }
+
+            if let Some(background_sync_enabled) = patch.background_sync_enabled {
+                persistent.settings.background_sync_enabled = background_sync_enabled;
             }
 
             if let Some(discovery_enabled) = patch.discovery_enabled {
@@ -406,6 +440,7 @@ impl RelayRuntime {
             staging_path: None,
             entries: Vec::new(),
             top_level_names: Vec::new(),
+            available_actions: Vec::new(),
         };
 
         let _ = self.upsert_transfer_job(job, true);
@@ -496,6 +531,7 @@ impl RelayRuntime {
             staging_path: None,
             entries: offer.entries.clone(),
             top_level_names: offer.top_level_names.clone(),
+            available_actions: Vec::new(),
         };
         self.upsert_transfer_job(job, true)?;
 
@@ -619,6 +655,40 @@ impl RelayRuntime {
         Ok(())
     }
 
+    pub fn share_received_transfer(&self, transfer_id: String) -> Result<()> {
+        let job = self
+            .find_transfer_job(&transfer_id)
+            .ok_or_else(|| anyhow!("transfer job not found"))?;
+        if job.direction != TransferDirection::Inbound || job.stage != TransferStage::Ready {
+            bail!("transfer is not ready to share");
+        }
+
+        let paths = transfers::payload_paths_from_job(&job);
+        self.inner.bridge.share_paths(&paths)?;
+        let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
+            job.ready_to_paste = false;
+            job.ready_action_state = ReadyActionState::Placed;
+        })?;
+        Ok(())
+    }
+
+    pub fn export_received_transfer(&self, transfer_id: String) -> Result<()> {
+        let job = self
+            .find_transfer_job(&transfer_id)
+            .ok_or_else(|| anyhow!("transfer job not found"))?;
+        if job.direction != TransferDirection::Inbound || job.stage != TransferStage::Ready {
+            bail!("transfer is not ready to export");
+        }
+
+        let paths = transfers::payload_paths_from_job(&job);
+        self.inner.bridge.export_paths(&paths)?;
+        let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
+            job.ready_to_paste = false;
+            job.ready_action_state = ReadyActionState::Placed;
+        })?;
+        Ok(())
+    }
+
     pub fn dismiss_transfer_job(&self, transfer_id: String) -> Result<()> {
         let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
             job.ready_to_paste = false;
@@ -697,12 +767,22 @@ impl RelayRuntime {
                 .context("failed to open cache directory")?;
         }
 
-        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        #[cfg(all(
+            not(target_os = "windows"),
+            not(target_os = "macos"),
+            not(target_os = "android"),
+            not(target_os = "ios")
+        ))]
         {
             std::process::Command::new("xdg-open")
                 .arg(&cache_root)
                 .spawn()
                 .context("failed to open cache directory")?;
+        }
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            bail!("opening the cache directory is not supported on mobile builds");
         }
 
         Ok(())
@@ -800,10 +880,14 @@ impl RelayRuntime {
     }
 
     fn emit_transfer_ready(&self, job: TransferJob) {
+        let mut job = job;
+        self.decorate_transfer_job(&mut job);
         let _ = self.inner.app.emit("transfer_ready", job);
     }
 
     fn emit_transfer_failed(&self, job: TransferJob) {
+        let mut job = job;
+        self.decorate_transfer_job(&mut job);
         let _ = self.inner.app.emit("transfer_failed", job);
     }
 
@@ -1180,6 +1264,7 @@ impl RelayRuntime {
                 settings: AppSettings {
                     device_name: String::new(),
                     launch_on_login: false,
+                    background_sync_enabled: false,
                     discovery_enabled: false,
                     sync_enabled: false,
                     active_device_id: None,
@@ -1367,6 +1452,35 @@ impl RelayRuntime {
             .and_then(|jobs| jobs.iter().find(|job| job.transfer_id == transfer_id).cloned())
     }
 
+    fn available_actions_for_job(&self, job: &TransferJob) -> Vec<TransferAction> {
+        if job.direction != TransferDirection::Inbound || job.stage != TransferStage::Ready {
+            return Vec::new();
+        }
+
+        let capabilities = self.runtime_capabilities();
+        let mut actions = Vec::new();
+        if capabilities.clipboard_files {
+            actions.push(TransferAction::PlaceOnClipboard);
+        }
+        if capabilities.share_externally {
+            actions.push(TransferAction::ShareExternally);
+        }
+        if capabilities.export_to_files {
+            actions.push(TransferAction::ExportToFiles);
+        }
+        actions
+    }
+
+    fn decorate_transfer_job(&self, job: &mut TransferJob) {
+        job.available_actions = self.available_actions_for_job(job);
+    }
+
+    fn decorate_transfer_jobs(&self, jobs: &mut [TransferJob]) {
+        for job in jobs {
+            self.decorate_transfer_job(job);
+        }
+    }
+
     fn upsert_transfer_job(&self, job: TransferJob, persist: bool) -> Result<()> {
         let snapshot = {
             let mut jobs = self
@@ -1476,6 +1590,8 @@ impl RelayRuntime {
     }
 
     fn emit_transfer_jobs(&self, jobs: Vec<TransferJob>) {
+        let mut jobs = jobs;
+        self.decorate_transfer_jobs(&mut jobs);
         let _ = self.inner.app.emit("transfer_jobs_updated", jobs);
     }
 

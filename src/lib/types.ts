@@ -2,6 +2,20 @@ export type PayloadKind = 'text' | 'image'
 export type AppLanguage = 'en' | 'zh-CN'
 export type ClipboardHistoryKind = 'text' | 'image' | 'fileRefs'
 export type ClipboardHistorySource = 'local' | 'remote' | 'transfer'
+export type RuntimePlatform =
+  | 'windows'
+  | 'macos'
+  | 'linux'
+  | 'android'
+  | 'ios'
+  | 'unknown'
+export type RuntimePermissionState = 'granted' | 'denied' | 'prompt' | 'unsupported'
+export type BackgroundSyncMode =
+  | 'desktop'
+  | 'foregroundOnly'
+  | 'foregroundService'
+  | 'appRefresh'
+  | 'unsupported'
 
 export type SyncState =
   | 'idle'
@@ -23,10 +37,40 @@ export type TransferStage =
   | 'canceled'
 export type ReadyActionState = 'pendingPrompt' | 'dismissed' | 'placed'
 export type TransferEntryKind = 'file' | 'directory'
+export type TransferAction = 'placeOnClipboard' | 'shareExternally' | 'exportToFiles'
+
+export interface RuntimeCapabilities {
+  tray: boolean
+  autostart: boolean
+  clipboardMonitor: boolean
+  clipboardFiles: boolean
+  openCacheDirectory: boolean
+  shareExternally: boolean
+  exportToFiles: boolean
+  backgroundSync: boolean
+  nativeDiscovery: boolean
+}
+
+export interface RuntimePermissions {
+  notifications: RuntimePermissionState
+  localNetwork: RuntimePermissionState
+  clipboard: RuntimePermissionState
+  backgroundSync: RuntimePermissionState
+  fileAccess: RuntimePermissionState
+}
+
+export interface BackgroundSyncState {
+  supported: boolean
+  enabled: boolean
+  active: boolean
+  mode: BackgroundSyncMode
+  message: string | null
+}
 
 export interface AppSettings {
   deviceName: string
   launchOnLogin: boolean
+  backgroundSyncEnabled: boolean
   discoveryEnabled: boolean
   syncEnabled: boolean
   activeDeviceId: string | null
@@ -109,6 +153,7 @@ export interface TransferJob {
   stagingPath: string | null
   entries: TransferEntry[]
   topLevelNames: string[]
+  availableActions: TransferAction[]
 }
 
 export interface SyncStatus {
@@ -123,11 +168,15 @@ export interface AppStateSnapshot {
   settings: AppSettings
   devices: TrustedDevice[]
   syncStatus: SyncStatus
+  runtimePlatform: RuntimePlatform
+  capabilities: RuntimeCapabilities
+  permissions: RuntimePermissions
 }
 
 export interface SettingsPatch {
   deviceName?: string
   launchOnLogin?: boolean
+  backgroundSyncEnabled?: boolean
   discoveryEnabled?: boolean
   syncEnabled?: boolean
   activeDeviceId?: string | null

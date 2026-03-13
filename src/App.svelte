@@ -3,7 +3,9 @@
   import {
     cancelTransferJob,
     dismissTransferJob,
+    exportReceivedTransfer,
     getAppState,
+    getBackgroundSyncState,
     isAutostartEnabled,
     listClipboardHistory,
     listTransferJobs,
@@ -15,15 +17,30 @@
     onTransferReady,
     openCacheDirectory,
     placeReceivedTransferOnClipboard,
+    requestRuntimePermissions,
     restoreClipboardHistoryEntry,
     setActiveDevice,
+    shareReceivedTransfer,
     syncAutostart,
     toggleSync,
     updateSettings,
   } from './lib/api'
   import { getMessages, normalizeLanguage } from './lib/i18n'
-  import type { AppStateSnapshot, ClipboardHistoryEntry, TransferJob } from './lib/types'
-  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+  import type {
+    AppStateSnapshot,
+    BackgroundSyncState,
+    ClipboardHistoryEntry,
+    RuntimeCapabilities,
+    RuntimePermissions,
+    RuntimePermissionState,
+    TransferAction,
+    TransferJob,
+  } from './lib/types'
+  import {
+    isPermissionGranted,
+    requestPermission,
+    sendNotification,
+  } from '@tauri-apps/plugin-notification'
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
   import {
@@ -39,22 +56,50 @@
   import { Separator } from '$lib/components/ui/separator'
   import { Switch } from '$lib/components/ui/switch'
   import {
+    Bell,
     ClipboardList,
     Copy,
+    Download,
     FolderOpen,
     Image,
     Link2,
+    Rocket,
     Search,
     Send,
+    Share2,
+    ShieldCheck,
+    Smartphone,
     Type,
   } from '@lucide/svelte'
+
+  const fallbackCapabilities: RuntimeCapabilities = {
+    tray: false,
+    autostart: false,
+    clipboardMonitor: false,
+    clipboardFiles: false,
+    openCacheDirectory: false,
+    shareExternally: false,
+    exportToFiles: false,
+    backgroundSync: false,
+    nativeDiscovery: false,
+  }
+
+  const fallbackPermissions: RuntimePermissions = {
+    notifications: 'unsupported',
+    localNetwork: 'unsupported',
+    clipboard: 'unsupported',
+    backgroundSync: 'unsupported',
+    fileAccess: 'unsupported',
+  }
 
   let snapshot: AppStateSnapshot | null = null
   let transferJobs: TransferJob[] = []
   let clipboardHistory: ClipboardHistoryEntry[] = []
+  let backgroundSyncState: BackgroundSyncState | null = null
   let busyTransferId: string | null = null
   let busyHistoryId: string | null = null
   let settingsBusy = false
+  let permissionsBusy = false
   let errorBanner: string | null = null
   const notifiedReady = new Set<string>()
 
@@ -72,30 +117,33 @@
   )
   $: visibleTransferJobs = transferJobs
   $: syncStatus = snapshot?.syncStatus
+  $: runtimePlatform = snapshot?.runtimePlatform ?? 'unknown'
+  $: runtimeCapabilities = snapshot?.capabilities ?? fallbackCapabilities
+  $: runtimePermissions = snapshot?.permissions ?? fallbackPermissions
+  $: isMobile = runtimePlatform === 'android' || runtimePlatform === 'ios'
+  $: permissionRows = [
+    [copy.notificationsPermission, runtimePermissions.notifications],
+    [copy.localNetworkPermission, runtimePermissions.localNetwork],
+    [copy.clipboardPermission, runtimePermissions.clipboard],
+    [copy.fileAccessPermission, runtimePermissions.fileAccess],
+    [copy.backgroundSyncPermission, runtimePermissions.backgroundSync],
+  ] satisfies Array<[string, RuntimePermissionState]>
+  $: permissionsNeedAttention = permissionRows.some(([, state]) =>
+    ['prompt', 'denied'].includes(state),
+  )
 
   async function refresh() {
-    const [state, jobs, history] = await Promise.all([
+    const [state, jobs, history, backgroundState] = await Promise.all([
       getAppState(),
       listTransferJobs(),
       listClipboardHistory(),
+      getBackgroundSyncState().catch(() => null),
     ])
+
     snapshot = state
     transferJobs = jobs
     clipboardHistory = history
-
-    try {
-      let shouldPersistAutostart = state.settings.launchOnLogin !== true
-      const autostartEnabled = await isAutostartEnabled().catch(() => state.settings.launchOnLogin)
-      if (!autostartEnabled) {
-        await syncAutostart(true)
-        shouldPersistAutostart = true
-      }
-      if (shouldPersistAutostart) {
-        snapshot = await updateSettings({ launchOnLogin: true })
-      }
-    } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
-    }
+    backgroundSyncState = backgroundState
   }
 
   async function patchSettings(patch: Parameters<typeof updateSettings>[0]) {
@@ -105,10 +153,42 @@
 
     try {
       snapshot = await updateSettings(patch)
+      backgroundSyncState = await getBackgroundSyncState().catch(() => backgroundSyncState)
     } catch (error) {
       errorBanner = error instanceof Error ? error.message : String(error)
     } finally {
       settingsBusy = false
+    }
+  }
+
+  async function toggleLaunchOnLogin(enabled: boolean) {
+    if (!runtimeCapabilities.autostart) return
+    settingsBusy = true
+    errorBanner = null
+
+    try {
+      await syncAutostart(enabled)
+      snapshot = await updateSettings({ launchOnLogin: enabled })
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      settingsBusy = false
+    }
+  }
+
+  async function refreshPermissions() {
+    permissionsBusy = true
+    errorBanner = null
+
+    try {
+      const permissions = await requestRuntimePermissions()
+      if (snapshot) {
+        snapshot = { ...snapshot, permissions }
+      }
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      permissionsBusy = false
     }
   }
 
@@ -135,6 +215,30 @@
     errorBanner = null
     try {
       await placeReceivedTransferOnClipboard(job.transferId)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyTransferId = null
+    }
+  }
+
+  async function shareTransfer(job: TransferJob) {
+    busyTransferId = job.transferId
+    errorBanner = null
+    try {
+      await shareReceivedTransfer(job.transferId)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyTransferId = null
+    }
+  }
+
+  async function exportTransfer(job: TransferJob) {
+    busyTransferId = job.transferId
+    errorBanner = null
+    try {
+      await exportReceivedTransfer(job.transferId)
     } catch (error) {
       errorBanner = error instanceof Error ? error.message : String(error)
     } finally {
@@ -248,6 +352,10 @@
     return 'secondary'
   }
 
+  function hasAction(job: TransferJob, action: TransferAction) {
+    return job.availableActions.includes(action)
+  }
+
   onMount(() => {
     let disposed = false
     void refresh()
@@ -303,7 +411,9 @@
               />
             </div>
             <div class="flex max-w-36 flex-col items-end gap-1 text-right">
-              <Badge variant={statusVariant(syncStatus?.state)}>{copy.syncState(syncStatus?.state ?? 'idle')}</Badge>
+              <Badge variant={statusVariant(syncStatus?.state)}>
+                {copy.syncState(syncStatus?.state ?? 'idle')}
+              </Badge>
               <p class="text-[11px] leading-4 text-muted-foreground">
                 {syncStatus?.message ?? ''}
               </p>
@@ -342,9 +452,7 @@
                   <Badge variant="outline">{activeDevice.isOnline ? copy.online : copy.offline}</Badge>
                 </div>
               {:else}
-                <div class="text-xs text-muted-foreground">
-                  {copy.noActivePair}
-                </div>
+                <div class="text-xs text-muted-foreground">{copy.noActivePair}</div>
               {/if}
             </div>
           </div>
@@ -383,11 +491,107 @@
 
       <Card class="shadow-sm">
         <CardHeader class="pb-3">
+          <div class="flex items-center gap-2">
+            <Smartphone class="size-4 text-muted-foreground" />
+            <CardTitle>{copy.environment}</CardTitle>
+          </div>
+          <CardDescription>
+            {copy.runtimePlatform(runtimePlatform)}
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3 pt-0">
+          <div class="rounded-lg border bg-background px-3 py-3">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <div class="font-medium">{copy.runtimePlatform(runtimePlatform)}</div>
+                <div class="text-xs text-muted-foreground">
+                  {backgroundSyncState?.message ?? copy.mobileLimitedHint}
+                </div>
+              </div>
+              <Badge variant="outline">
+                {backgroundSyncState
+                  ? copy.backgroundMode(backgroundSyncState.mode, backgroundSyncState.active)
+                  : copy.runtimePlatform(runtimePlatform)}
+              </Badge>
+            </div>
+          </div>
+
+          {#if runtimeCapabilities.autostart}
+            <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-3">
+              <div>
+                <div class="font-medium">{copy.launchOnLogin}</div>
+                <div class="text-xs text-muted-foreground">{copy.launchOnLoginHint}</div>
+              </div>
+              <Switch
+                checked={snapshot.settings.launchOnLogin}
+                disabled={settingsBusy}
+                on:change={(event) =>
+                  toggleLaunchOnLogin((event.target as HTMLInputElement).checked)}
+              />
+            </div>
+          {/if}
+
+          {#if runtimeCapabilities.backgroundSync}
+            <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-3">
+              <div>
+                <div class="font-medium">{copy.backgroundSync}</div>
+                <div class="text-xs text-muted-foreground">
+                  {backgroundSyncState?.message ?? copy.backgroundSyncHint}
+                </div>
+              </div>
+              <Switch
+                checked={snapshot.settings.backgroundSyncEnabled}
+                disabled={settingsBusy}
+                on:change={(event) =>
+                  patchSettings({
+                    backgroundSyncEnabled: (event.target as HTMLInputElement).checked,
+                  })}
+              />
+            </div>
+          {/if}
+
+          <div class="space-y-2 rounded-lg border bg-background px-3 py-3">
+            <div class="flex items-center justify-between gap-3">
+              <div class="flex items-center gap-2">
+                <ShieldCheck class="size-4 text-muted-foreground" />
+                <div class="font-medium">{copy.permissions}</div>
+              </div>
+              {#if permissionsNeedAttention}
+                <Button
+                  disabled={permissionsBusy}
+                  on:click={refreshPermissions}
+                  size="sm"
+                  variant="secondary"
+                >
+                  {copy.requestPermissions}
+                </Button>
+              {/if}
+            </div>
+            <p class="text-xs text-muted-foreground">{copy.permissionsHint}</p>
+            <div class="space-y-2 text-xs">
+              {#each permissionRows as [label, state]}
+                <div class="flex items-center justify-between gap-3">
+                  <span>{label}</span>
+                  <Badge variant={state === 'granted' ? 'secondary' : 'outline'}>
+                    {copy.permissionState(state)}
+                  </Badge>
+                </div>
+              {/each}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card class="shadow-sm">
+        <CardHeader class="pb-3">
           <div class="flex items-center justify-between gap-3">
             <div class="flex items-center gap-2">
               <Send class="size-4 text-muted-foreground" />
               <CardTitle>{copy.transfers}</CardTitle>
             </div>
+            {#if isMobile}
+              <Badge variant="outline">{copy.mobileLimitedHint}</Badge>
+            {/if}
           </div>
         </CardHeader>
         <CardContent class="pt-0">
@@ -429,24 +633,54 @@
                   </div>
 
                   {#if job.stage === 'ready' && job.direction === 'inbound' && job.readyActionState === 'pendingPrompt'}
-                    <div class="flex items-center justify-end gap-2">
-                      <Button
-                        disabled={busyTransferId === job.transferId}
-                        on:click={() => placeTransfer(job)}
-                        size="sm"
-                      >
-                        {copy.placeOnClipboard}
-                      </Button>
-                      <Button
-                        disabled={busyTransferId === job.transferId}
-                        on:click={() => dismissTransfer(job)}
-                        size="sm"
-                        variant="outline"
-                      >
-                        {copy.dismiss}
-                      </Button>
-                    </div>
-                    <p class="text-[11px] text-muted-foreground">{copy.replaceWarning}</p>
+                    {#if job.availableActions.length > 0}
+                      <div class="flex flex-wrap items-center justify-end gap-2">
+                        {#if hasAction(job, 'placeOnClipboard')}
+                          <Button
+                            disabled={busyTransferId === job.transferId}
+                            on:click={() => placeTransfer(job)}
+                            size="sm"
+                          >
+                            {copy.placeOnClipboard}
+                          </Button>
+                        {/if}
+                        {#if hasAction(job, 'shareExternally')}
+                          <Button
+                            disabled={busyTransferId === job.transferId}
+                            on:click={() => shareTransfer(job)}
+                            size="sm"
+                            variant="secondary"
+                          >
+                            <Share2 class="size-3.5" />
+                            {copy.shareExternally}
+                          </Button>
+                        {/if}
+                        {#if hasAction(job, 'exportToFiles')}
+                          <Button
+                            disabled={busyTransferId === job.transferId}
+                            on:click={() => exportTransfer(job)}
+                            size="sm"
+                            variant="outline"
+                          >
+                            <Download class="size-3.5" />
+                            {copy.exportToFiles}
+                          </Button>
+                        {/if}
+                        <Button
+                          disabled={busyTransferId === job.transferId}
+                          on:click={() => dismissTransfer(job)}
+                          size="sm"
+                          variant="outline"
+                        >
+                          {copy.dismiss}
+                        </Button>
+                      </div>
+                      {#if hasAction(job, 'placeOnClipboard')}
+                        <p class="text-[11px] text-muted-foreground">{copy.replaceWarning}</p>
+                      {/if}
+                    {:else}
+                      <p class="text-[11px] text-muted-foreground">{copy.actionsUnavailable}</p>
+                    {/if}
                   {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
                     <div class="flex justify-end">
                       <Button
@@ -473,10 +707,12 @@
               <ClipboardList class="size-4 text-muted-foreground" />
               <CardTitle>{copy.clipboardHistory}</CardTitle>
             </div>
-            <Button on:click={openCache} size="sm" variant="ghost">
-              <FolderOpen class="size-4" />
-              {copy.openCacheDirectory}
-            </Button>
+            {#if runtimeCapabilities.openCacheDirectory}
+              <Button on:click={openCache} size="sm" variant="ghost">
+                <FolderOpen class="size-4" />
+                {copy.openCacheDirectory}
+              </Button>
+            {/if}
           </div>
         </CardHeader>
         <CardContent class="pt-0">
@@ -506,7 +742,9 @@
                         </div>
                       </div>
                     </div>
-                    <div class="shrink-0 text-[11px] text-muted-foreground">{formatTime(entry.createdAt)}</div>
+                    <div class="shrink-0 text-[11px] text-muted-foreground">
+                      {formatTime(entry.createdAt)}
+                    </div>
                   </div>
 
                   <p class="line-clamp-2 text-xs leading-5 text-muted-foreground">

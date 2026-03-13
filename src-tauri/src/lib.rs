@@ -5,9 +5,10 @@ mod models;
 mod runtime;
 mod store;
 mod transport;
+mod transfers;
 mod tray;
 
-use crate::models::{AppStateSnapshot, SettingsPatch, TrustedDevice};
+use crate::models::{AppStateSnapshot, SettingsPatch, TransferJob, TrustedDevice};
 use crate::runtime::RelayRuntime;
 use tauri::{Manager, State, WindowEvent};
 
@@ -57,6 +58,37 @@ fn update_settings(
     Ok(snapshot)
 }
 
+#[tauri::command]
+fn list_transfer_jobs(runtime: State<'_, RelayRuntime>) -> Result<Vec<TransferJob>, String> {
+    Ok(runtime.list_transfer_jobs())
+}
+
+#[tauri::command]
+fn place_received_transfer_on_clipboard(
+    runtime: State<'_, RelayRuntime>,
+    transfer_id: String,
+) -> Result<(), String> {
+    runtime
+        .place_received_transfer_on_clipboard(transfer_id)
+        .map_err(to_error_string)
+}
+
+#[tauri::command]
+fn dismiss_transfer_job(
+    runtime: State<'_, RelayRuntime>,
+    transfer_id: String,
+) -> Result<(), String> {
+    runtime.dismiss_transfer_job(transfer_id).map_err(to_error_string)
+}
+
+#[tauri::command]
+fn cancel_transfer_job(
+    runtime: State<'_, RelayRuntime>,
+    transfer_id: String,
+) -> Result<(), String> {
+    runtime.cancel_transfer_job(transfer_id).map_err(to_error_string)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -89,7 +121,11 @@ pub fn run() {
             list_devices,
             set_active_device,
             toggle_sync,
-            update_settings
+            update_settings,
+            list_transfer_jobs,
+            place_received_transfer_on_clipboard,
+            dismiss_transfer_job,
+            cancel_transfer_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

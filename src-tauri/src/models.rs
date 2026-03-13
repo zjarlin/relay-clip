@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const PROTOCOL_VERSION: &str = "relayclip/v1";
-pub const CAPABILITIES: [&str; 2] = ["text_utf8", "image_png"];
+pub const CAPABILITIES: [&str; 3] = ["text_utf8", "image_png", "file_refs"];
+pub const TRANSFER_RETENTION_HOURS: i64 = 24;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppLanguage {
@@ -176,6 +177,85 @@ pub struct PersistentState {
     pub settings: AppSettings,
     pub certificate_der_b64: String,
     pub private_key_der_b64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferDirection {
+    Outbound,
+    Inbound,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferKind {
+    FileRefs,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferStage {
+    Preparing,
+    Queued,
+    Downloading,
+    Verifying,
+    Ready,
+    Failed,
+    Canceled,
+}
+
+impl TransferStage {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Ready | Self::Failed | Self::Canceled)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadyActionState {
+    PendingPrompt,
+    Dismissed,
+    Placed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferEntry {
+    pub relative_path: String,
+    pub entry_kind: TransferEntryKind,
+    pub size: u64,
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferJob {
+    pub transfer_id: String,
+    pub peer_device_id: String,
+    pub direction: TransferDirection,
+    pub kind: TransferKind,
+    pub display_name: String,
+    pub total_bytes: u64,
+    pub completed_bytes: u64,
+    pub total_entries: u32,
+    pub completed_entries: u32,
+    pub stage: TransferStage,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub warning_message: Option<String>,
+    pub ready_to_paste: bool,
+    pub ready_action_state: ReadyActionState,
+    pub staging_path: Option<String>,
+    pub entries: Vec<TransferEntry>,
+    pub top_level_names: Vec<String>,
 }
 
 pub fn current_platform() -> String {

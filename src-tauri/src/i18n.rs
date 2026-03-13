@@ -32,16 +32,12 @@ pub fn no_active_device(language: AppLanguage) -> String {
 
 pub fn sending(language: AppLanguage, kind: &ClipboardPayloadKind, device_name: &str) -> String {
     match language {
-        AppLanguage::ZhCn => format!(
-            "正在把{}剪贴板发送到 {}",
-            payload_kind(language, kind),
-            device_name
-        ),
-        AppLanguage::En => format!(
-            "Sending {} clipboard to {}",
-            payload_kind(language, kind),
-            device_name
-        ),
+        AppLanguage::ZhCn => {
+            format!("正在将{}剪贴板发送到 {}", payload_kind(language, kind), device_name)
+        }
+        AppLanguage::En => {
+            format!("Sending {} clipboard to {}", payload_kind(language, kind), device_name)
+        }
     }
 }
 
@@ -75,8 +71,15 @@ pub fn discovery_disabled(language: AppLanguage) -> String {
 
 pub fn active_device_ready(language: AppLanguage) -> String {
     match language {
-        AppLanguage::ZhCn => "活动设备在线，已准备就绪".to_string(),
+        AppLanguage::ZhCn => "当前配对设备在线，可直接接力".to_string(),
         AppLanguage::En => "Active device is online and ready".to_string(),
+    }
+}
+
+pub fn available_peers(language: AppLanguage, count: usize) -> String {
+    match language {
+        AppLanguage::ZhCn => format!("已发现 {count} 台可配对设备"),
+        AppLanguage::En => format!("Found {count} nearby device(s) ready to pair"),
     }
 }
 
@@ -124,7 +127,7 @@ pub fn tray_devices(language: AppLanguage) -> &'static str {
 
 pub fn tray_waiting_for_devices(language: AppLanguage) -> &'static str {
     match language {
-        AppLanguage::ZhCn => "正在等待设备出现",
+        AppLanguage::ZhCn => "等待设备出现",
         AppLanguage::En => "Waiting for devices",
     }
 }

@@ -1,11 +1,13 @@
 use crate::models::{ClipboardPayload, ClipboardPayloadKind};
 use crate::runtime::RelayRuntime;
+use crate::transfers::{self, LocalFileClipboard};
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::{Clipboard, ImageData};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +17,12 @@ pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 pub struct ClipboardPacket {
     pub meta: ClipboardPayload,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ClipboardMonitorEvent {
+    Packet(ClipboardPacket),
+    FileList(LocalFileClipboard),
 }
 
 pub fn start_monitor(runtime: RelayRuntime) {
@@ -31,12 +39,24 @@ pub fn start_monitor(runtime: RelayRuntime) {
 
         loop {
             match read_current(&mut clipboard) {
-                Ok(Some(packet)) => {
-                    if last_hash.as_deref() != Some(packet.meta.hash.as_str()) {
-                        last_hash = Some(packet.meta.hash.clone());
+                Ok(Some(event)) => {
+                    let current_hash = match &event {
+                        ClipboardMonitorEvent::Packet(packet) => packet.meta.hash.clone(),
+                        ClipboardMonitorEvent::FileList(file_list) => file_list.hash.clone(),
+                    };
+
+                    if last_hash.as_deref() != Some(current_hash.as_str()) {
+                        last_hash = Some(current_hash);
                         let relay = runtime.clone();
                         tauri::async_runtime::spawn(async move {
-                            relay.handle_local_clipboard(packet).await;
+                            match event {
+                                ClipboardMonitorEvent::Packet(packet) => {
+                                    relay.handle_local_clipboard(packet).await;
+                                }
+                                ClipboardMonitorEvent::FileList(file_list) => {
+                                    relay.handle_local_file_list(file_list).await;
+                                }
+                            }
                         });
                     }
                 }
@@ -79,6 +99,15 @@ pub fn write_remote(packet: &ClipboardPacket) -> Result<()> {
     Ok(())
 }
 
+pub fn write_file_list(paths: &[PathBuf]) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("failed to access system clipboard")?;
+    clipboard
+        .set()
+        .file_list(paths)
+        .context("failed to write file list to clipboard")?;
+    Ok(())
+}
+
 pub fn packet_from_remote(
     kind: ClipboardPayloadKind,
     mime: String,
@@ -100,7 +129,14 @@ pub fn packet_from_remote(
     })
 }
 
-fn read_current(clipboard: &mut Clipboard) -> Result<Option<ClipboardPacket>> {
+fn read_current(clipboard: &mut Clipboard) -> Result<Option<ClipboardMonitorEvent>> {
+    if let Ok(paths) = clipboard.get().file_list() {
+        if !paths.is_empty() {
+            let file_list = transfers::file_clipboard(paths)?;
+            return Ok(Some(ClipboardMonitorEvent::FileList(file_list)));
+        }
+    }
+
     if let Ok(text) = clipboard.get_text() {
         if text.trim().is_empty() {
             return Ok(None);
@@ -108,7 +144,7 @@ fn read_current(clipboard: &mut Clipboard) -> Result<Option<ClipboardPacket>> {
 
         let bytes = text.into_bytes();
         let hash = hash_bytes("text", &bytes);
-        return Ok(Some(ClipboardPacket {
+        return Ok(Some(ClipboardMonitorEvent::Packet(ClipboardPacket {
             meta: ClipboardPayload {
                 kind: ClipboardPayloadKind::Text,
                 mime: "text/plain; charset=utf-8".to_string(),
@@ -116,13 +152,13 @@ fn read_current(clipboard: &mut Clipboard) -> Result<Option<ClipboardPacket>> {
                 hash,
             },
             bytes,
-        }));
+        })));
     }
 
     if let Ok(image) = clipboard.get_image() {
         let png_bytes = encode_png(image)?;
         let hash = hash_bytes("image", &png_bytes);
-        return Ok(Some(ClipboardPacket {
+        return Ok(Some(ClipboardMonitorEvent::Packet(ClipboardPacket {
             meta: ClipboardPayload {
                 kind: ClipboardPayloadKind::Image,
                 mime: "image/png".to_string(),
@@ -130,7 +166,7 @@ fn read_current(clipboard: &mut Clipboard) -> Result<Option<ClipboardPacket>> {
                 hash,
             },
             bytes: png_bytes,
-        }));
+        })));
     }
 
     Ok(None)

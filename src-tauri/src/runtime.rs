@@ -3,18 +3,23 @@ use crate::discovery::{self, DiscoveryHandle};
 use crate::i18n;
 use crate::models::{
     AppLanguage, AppSettings, AppStateSnapshot, ClipboardPayload, LocalDevice, PersistentState,
-    SettingsPatch, StoredTrustedDevice, SyncState, SyncStatus, TrustedDevice,
+    ReadyActionState, SettingsPatch, SyncState, SyncStatus, TransferDirection, TransferJob,
+    TransferKind, TransferStage, TrustedDevice,
 };
 use crate::store;
-use crate::transport::{self, ClipboardEnvelope};
-use anyhow::{anyhow, bail, Result};
+use crate::transport::{self, ClipboardEnvelope, IncomingTransferOffer};
+use crate::tray;
+use crate::transfers::{self, LocalFileClipboard};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
 
 pub const SERVICE_TYPE: &str = "_relayclip._tcp.local.";
 const RECENT_HASH_LIMIT: usize = 32;
@@ -38,31 +43,63 @@ pub struct RelayRuntime {
     inner: Arc<RuntimeInner>,
 }
 
+pub(crate) struct TransferLease {
+    _permit: OwnedSemaphorePermit,
+}
+
+pub(crate) struct IncomingTransferPreparation {
+    pub staging_root: PathBuf,
+    pub lease: TransferLease,
+}
+
 struct RuntimeInner {
     app: AppHandle,
     state_path: PathBuf,
     persistent: RwLock<PersistentState>,
+    transfer_jobs: RwLock<Vec<TransferJob>>,
     presence: RwLock<HashMap<String, DevicePresence>>,
+    active_device_id: RwLock<Option<String>>,
     service_map: Mutex<HashMap<String, String>>,
     recent_hashes: Mutex<VecDeque<String>>,
     sync_status: RwLock<SyncStatus>,
     discovery: Mutex<Option<DiscoveryHandle>>,
     listen_port: AtomicU16,
     sequence: AtomicU64,
+    transfer_gate: Arc<Semaphore>,
+    transfer_controls: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 #[derive(Clone, Debug)]
 struct DevicePresence {
+    device_id: String,
+    name: String,
+    platform: String,
+    fingerprint: String,
+    capabilities: Vec<String>,
     host_name: Option<String>,
     addresses: Vec<IpAddr>,
     port: u16,
     is_online: bool,
     last_seen: DateTime<Utc>,
+    last_sync_at: Option<DateTime<Utc>>,
+    last_sync_status: Option<String>,
+}
+
+#[derive(Clone)]
+struct ActiveTarget {
+    device_id: String,
+    name: String,
+    fingerprint: String,
+    socket_addr: SocketAddr,
 }
 
 impl RelayRuntime {
     pub fn new(app: AppHandle) -> Result<Self> {
         let (state_path, persistent) = store::load_or_create()?;
+        let mut transfer_jobs = store::load_transfer_jobs(&state_path)?;
+        store::cleanup_transfer_artifacts(&state_path, &mut transfer_jobs)?;
+        store::save_transfer_jobs(&state_path, &transfer_jobs)?;
+
         let language = persistent.settings.language;
         let sync_status = if persistent.settings.sync_enabled {
             SyncStatus::new(SyncState::Discovering, Some(i18n::advertising(language)))
@@ -75,13 +112,17 @@ impl RelayRuntime {
                 app,
                 state_path,
                 persistent: RwLock::new(persistent),
+                transfer_jobs: RwLock::new(transfer_jobs),
                 presence: RwLock::new(HashMap::new()),
+                active_device_id: RwLock::new(None),
                 service_map: Mutex::new(HashMap::new()),
                 recent_hashes: Mutex::new(VecDeque::new()),
                 sync_status: RwLock::new(sync_status),
                 discovery: Mutex::new(None),
                 listen_port: AtomicU16::new(0),
                 sequence: AtomicU64::new(1),
+                transfer_gate: Arc::new(Semaphore::new(transfers::MAX_ACTIVE_TRANSFER_JOBS)),
+                transfer_controls: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -104,6 +145,7 @@ impl RelayRuntime {
         clipboard::start_monitor(self.clone());
         self.emit_devices_updated();
         self.emit_sync_status_changed();
+        self.emit_transfer_jobs_updated();
         Ok(())
     }
 
@@ -121,10 +163,12 @@ impl RelayRuntime {
 
     pub fn snapshot(&self) -> Result<AppStateSnapshot> {
         let persistent = self.persistent_clone();
+        let mut settings = persistent.settings.clone();
+        settings.active_device_id = self.active_device_id_clone();
         Ok(AppStateSnapshot {
             local_device: persistent.local_device.clone(),
-            settings: persistent.settings.clone(),
-            devices: self.collect_devices(&persistent),
+            settings,
+            devices: self.collect_devices(&persistent.local_device.device_id),
             sync_status: self.sync_status_clone(),
         })
     }
@@ -135,22 +179,39 @@ impl RelayRuntime {
             .unwrap_or_default()
     }
 
+    pub fn list_transfer_jobs(&self) -> Vec<TransferJob> {
+        let mut jobs = self
+            .inner
+            .transfer_jobs
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        jobs.sort_by(|left, right| {
+            transfer_sort_rank(left)
+                .cmp(&transfer_sort_rank(right))
+                .then(right.started_at.cmp(&left.started_at))
+        });
+        jobs
+    }
+
     pub fn set_active_device(&self, device_id: String) -> Result<AppStateSnapshot> {
-        {
-            let mut persistent = self
-                .inner
-                .persistent
-                .write()
-                .map_err(|_| anyhow!("persistent state lock poisoned"))?;
-            if !persistent.trusted_devices.contains_key(&device_id) {
-                bail!(match persistent.settings.language {
-                    AppLanguage::ZhCn => "未知设备",
-                    AppLanguage::En => "unknown device",
-                });
-            }
-            persistent.settings.active_device_id = Some(device_id);
-            self.persist_locked(&persistent)?;
+        let local_device_id = self.local_device().device_id;
+        if device_id == local_device_id {
+            bail!("cannot pair this device with itself");
         }
+        let presence = self
+            .inner
+            .presence
+            .read()
+            .map_err(|_| anyhow!("presence lock poisoned"))?;
+        let Some(device) = presence.get(&device_id) else {
+            bail!("unknown device");
+        };
+        if !device.is_online {
+            bail!("device is offline");
+        }
+        drop(presence);
+        self.set_active_device_id(Some(device_id));
 
         self.refresh_sync_summary();
         self.emit_devices_updated();
@@ -210,10 +271,6 @@ impl RelayRuntime {
                 persistent.settings.sync_enabled = sync_enabled;
             }
 
-            if let Some(active_device_id) = patch.active_device_id {
-                persistent.settings.active_device_id = active_device_id;
-            }
-
             if let Some(language) = patch.language {
                 persistent.settings.language = language;
             }
@@ -225,6 +282,10 @@ impl RelayRuntime {
             let enabled = enabled_after_restart
                 .unwrap_or_else(|| self.persistent_clone().settings.discovery_enabled);
             self.restart_discovery(enabled)?;
+        }
+
+        if let Some(active_device_id) = patch.active_device_id {
+            self.set_active_device_id(active_device_id);
         }
 
         self.refresh_sync_summary();
@@ -251,8 +312,10 @@ impl RelayRuntime {
                 return;
             }
             Err(error) => {
-                let language = self.language();
-                self.emit_clipboard_error(i18n::route_lookup_failed(language, &error.to_string()));
+                self.emit_clipboard_error(i18n::route_lookup_failed(
+                    self.language(),
+                    &error.to_string(),
+                ));
                 return;
             }
         };
@@ -273,21 +336,71 @@ impl RelayRuntime {
         );
 
         match transport::send_envelope(target.socket_addr, &target.fingerprint, envelope).await {
-            Ok(_) => {
-                self.record_device_sync(
-                    &target.device_id,
-                    i18n::relayed(language, &packet.meta.kind),
-                    Some(packet.meta),
-                );
-            }
-            Err(error) => {
-                self.record_device_failure(
-                    &target.device_id,
-                    i18n::relay_failed(language, &error.to_string()),
-                    Some(packet.meta),
-                );
-            }
+            Ok(_) => self.record_device_sync(
+                &target.device_id,
+                i18n::relayed(language, &packet.meta.kind),
+                Some(packet.meta),
+            ),
+            Err(error) => self.record_device_failure(
+                &target.device_id,
+                i18n::relay_failed(language, &error.to_string()),
+                Some(packet.meta),
+            ),
         }
+    }
+
+    pub async fn handle_local_file_list(&self, file_list: LocalFileClipboard) {
+        if !self.is_sync_enabled() || self.is_recent_hash(&file_list.hash) {
+            return;
+        }
+
+        self.remember_hash(file_list.hash.clone());
+
+        let target = match self.active_target() {
+            Ok(Some(target)) => target,
+            Ok(None) => return,
+            Err(error) => {
+                self.emit_clipboard_error(i18n::route_lookup_failed(
+                    self.language(),
+                    &error.to_string(),
+                ));
+                return;
+            }
+        };
+
+        let transfer_id = Uuid::new_v4().to_string();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let job = TransferJob {
+            transfer_id: transfer_id.clone(),
+            peer_device_id: target.device_id.clone(),
+            direction: TransferDirection::Outbound,
+            kind: TransferKind::FileRefs,
+            display_name: file_list.display_name.clone(),
+            total_bytes: 0,
+            completed_bytes: 0,
+            total_entries: 0,
+            completed_entries: 0,
+            stage: TransferStage::Preparing,
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            warning_message: None,
+            ready_to_paste: false,
+            ready_action_state: ReadyActionState::Placed,
+            staging_path: None,
+            entries: Vec::new(),
+            top_level_names: Vec::new(),
+        };
+
+        let _ = self.upsert_transfer_job(job, true);
+        self.register_transfer_control(transfer_id.clone(), cancel_flag.clone());
+
+        let runtime = self.clone();
+        tauri::async_runtime::spawn(async move {
+            runtime
+                .process_outbound_transfer(transfer_id, target, file_list.paths, cancel_flag)
+                .await;
+        });
     }
 
     pub async fn handle_incoming_envelope(&self, envelope: ClipboardEnvelope) -> Result<()> {
@@ -329,60 +442,180 @@ impl RelayRuntime {
         Ok(())
     }
 
+    pub async fn prepare_incoming_transfer(
+        &self,
+        offer: &IncomingTransferOffer,
+    ) -> Result<IncomingTransferPreparation> {
+        if !self.is_sync_enabled() {
+            bail!("file relay is paused");
+        }
+        if offer.target_device_id != self.local_device().device_id {
+            bail!("incoming transfer is not addressed to this device");
+        }
+        if self.active_device_id_clone().as_deref() != Some(offer.origin_device_id.as_str()) {
+            bail!("incoming file relay is only accepted from the active device");
+        }
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.register_transfer_control(offer.transfer_id.clone(), cancel_flag);
+
+        let job = TransferJob {
+            transfer_id: offer.transfer_id.clone(),
+            peer_device_id: offer.origin_device_id.clone(),
+            direction: TransferDirection::Inbound,
+            kind: TransferKind::FileRefs,
+            display_name: offer.display_name.clone(),
+            total_bytes: offer.total_bytes,
+            completed_bytes: 0,
+            total_entries: offer.total_entries,
+            completed_entries: 0,
+            stage: TransferStage::Preparing,
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            warning_message: offer.warning_message.clone(),
+            ready_to_paste: false,
+            ready_action_state: ReadyActionState::PendingPrompt,
+            staging_path: None,
+            entries: offer.entries.clone(),
+            top_level_names: offer.top_level_names.clone(),
+        };
+        self.upsert_transfer_job(job, true)?;
+
+        let staging_root = store::transfers_root_path(&self.inner.state_path).join(&offer.transfer_id);
+        if staging_root.exists() {
+            let _ = std::fs::remove_dir_all(&staging_root);
+        }
+        std::fs::create_dir_all(transfers::transfer_payload_dir(&staging_root))
+            .with_context(|| format!("failed to create {}", staging_root.display()))?;
+        transfers::ensure_space_for(Path::new(&staging_root), offer.total_bytes)?;
+
+        let lease = self.acquire_transfer_lease(&offer.transfer_id).await?;
+        self.set_transfer_stage(
+            &offer.transfer_id,
+            TransferStage::Downloading,
+            Some(staging_root.to_string_lossy().into_owned()),
+            true,
+        )?;
+
+        let payload_root = transfers::transfer_payload_dir(&staging_root);
+        for entry in &offer.entries {
+            if entry.entry_kind == crate::models::TransferEntryKind::Directory {
+                let dir_path = payload_root.join(relative_path_to_native(&entry.relative_path));
+                std::fs::create_dir_all(&dir_path)
+                    .with_context(|| format!("failed to create {}", dir_path.display()))?;
+            }
+        }
+
+        Ok(IncomingTransferPreparation { staging_root, lease })
+    }
+
+    pub fn complete_incoming_transfer(&self, transfer_id: &str) -> Result<()> {
+        if let Some(job) = self.finish_transfer(transfer_id, TransferStage::Ready, None, |job| {
+            job.ready_to_paste = true;
+            job.ready_action_state = ReadyActionState::PendingPrompt;
+        })? {
+            self.emit_transfer_ready(job);
+        }
+        Ok(())
+    }
+
+    pub fn complete_outbound_transfer(&self, transfer_id: &str) -> Result<()> {
+        let _ = self.finish_transfer(transfer_id, TransferStage::Ready, None, |job| {
+            job.ready_to_paste = false;
+            job.ready_action_state = ReadyActionState::Placed;
+        })?;
+        Ok(())
+    }
+
+    pub fn fail_transfer(&self, transfer_id: &str, message: impl Into<String>) -> Result<()> {
+        if let Some(job) = self.finish_transfer(
+            transfer_id,
+            TransferStage::Failed,
+            Some(message.into()),
+            |job| job.ready_to_paste = false,
+        )? {
+            self.emit_transfer_failed(job);
+        }
+        Ok(())
+    }
+
+    pub fn cancel_transfer(&self, transfer_id: &str) -> Result<()> {
+        if let Ok(mut controls) = self.inner.transfer_controls.lock() {
+            if let Some(cancel) = controls.remove(transfer_id) {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _ = self.finish_transfer(transfer_id, TransferStage::Canceled, None, |job| {
+            job.ready_to_paste = false;
+        })?;
+        Ok(())
+    }
+
+    pub fn increment_transfer_progress(
+        &self,
+        transfer_id: &str,
+        bytes_delta: u64,
+        entries_delta: u32,
+    ) -> Result<()> {
+        let snapshot = {
+            let mut jobs = self
+                .inner
+                .transfer_jobs
+                .write()
+                .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
+            if let Some(job) = jobs.iter_mut().find(|job| job.transfer_id == transfer_id) {
+                job.completed_bytes = job.completed_bytes.saturating_add(bytes_delta);
+                job.completed_entries = job.completed_entries.saturating_add(entries_delta);
+            }
+            jobs.clone()
+        };
+        self.emit_transfer_jobs(snapshot);
+        Ok(())
+    }
+
+    pub fn place_received_transfer_on_clipboard(&self, transfer_id: String) -> Result<()> {
+        let job = self
+            .find_transfer_job(&transfer_id)
+            .ok_or_else(|| anyhow!("transfer job not found"))?;
+        if job.direction != TransferDirection::Inbound || job.stage != TransferStage::Ready {
+            bail!("transfer is not ready to place on the clipboard");
+        }
+
+        let paths = transfers::payload_paths_from_job(&job);
+        if paths.is_empty() {
+            bail!("the received files are no longer available");
+        }
+
+        self.remember_hash(transfers::hash_paths(&paths)?);
+        tauri::async_runtime::block_on(tauri::async_runtime::spawn_blocking(move || {
+            clipboard::write_file_list(&paths)
+        }))
+        .map_err(|error| anyhow!("clipboard file list join error: {error}"))??;
+
+        let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
+            job.ready_to_paste = false;
+            job.ready_action_state = ReadyActionState::Placed;
+        })?;
+        Ok(())
+    }
+
+    pub fn dismiss_transfer_job(&self, transfer_id: String) -> Result<()> {
+        let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
+            job.ready_to_paste = false;
+            job.ready_action_state = ReadyActionState::Dismissed;
+        })?;
+        Ok(())
+    }
+
+    pub fn cancel_transfer_job(&self, transfer_id: String) -> Result<()> {
+        self.cancel_transfer(&transfer_id)
+    }
+
     pub fn upsert_discovered_device(&self, peer: DiscoveredPeer) -> Result<()> {
         if peer.protocol_version != crate::models::PROTOCOL_VERSION {
             return Ok(());
-        }
-
-        let can_auto_trust = peer
-            .host_name
-            .as_deref()
-            .is_some_and(|host| host.ends_with(".local."))
-            && peer.addresses.iter().any(is_private_ip);
-
-        {
-            let mut persistent = self
-                .inner
-                .persistent
-                .write()
-                .map_err(|_| anyhow!("persistent state lock poisoned"))?;
-
-            match persistent.trusted_devices.get_mut(&peer.device_id) {
-                Some(device) => {
-                    if !device.fingerprint.eq(&peer.fingerprint) {
-                        bail!("stored fingerprint does not match the discovered device");
-                    }
-                    device.name = peer.name.clone();
-                    device.platform = peer.platform.clone();
-                    device.capabilities = peer.capabilities.clone();
-                    device.host_name = peer.host_name.clone();
-                    device.last_seen = Some(Utc::now());
-                }
-                None if can_auto_trust => {
-                    persistent.trusted_devices.insert(
-                        peer.device_id.clone(),
-                        StoredTrustedDevice {
-                            device_id: peer.device_id.clone(),
-                            name: peer.name.clone(),
-                            platform: peer.platform.clone(),
-                            fingerprint: peer.fingerprint.clone(),
-                            auto_trusted: true,
-                            capabilities: peer.capabilities.clone(),
-                            last_seen: Some(Utc::now()),
-                            last_sync_at: None,
-                            last_sync_status: None,
-                            host_name: peer.host_name.clone(),
-                        },
-                    );
-
-                    if persistent.settings.active_device_id.is_none() {
-                        persistent.settings.active_device_id = Some(peer.device_id.clone());
-                    }
-                }
-                None => return Ok(()),
-            }
-
-            self.persist_locked(&persistent)?;
         }
 
         {
@@ -391,14 +624,22 @@ impl RelayRuntime {
                 .presence
                 .write()
                 .map_err(|_| anyhow!("presence lock poisoned"))?;
+            let previous = presence.get(&peer.device_id).cloned();
             presence.insert(
                 peer.device_id.clone(),
                 DevicePresence {
+                    device_id: peer.device_id.clone(),
+                    name: peer.name.clone(),
+                    platform: peer.platform.clone(),
+                    fingerprint: peer.fingerprint.clone(),
+                    capabilities: peer.capabilities.clone(),
                     host_name: peer.host_name.clone(),
                     addresses: peer.addresses.clone(),
                     port: peer.port,
                     is_online: true,
                     last_seen: Utc::now(),
+                    last_sync_at: previous.as_ref().and_then(|device| device.last_sync_at),
+                    last_sync_status: previous.and_then(|device| device.last_sync_status),
                 },
             );
         }
@@ -421,9 +662,7 @@ impl RelayRuntime {
         if let Ok(mut service_map) = self.inner.service_map.lock() {
             if let Some(device_id) = service_map.remove(fullname) {
                 if let Ok(mut presence) = self.inner.presence.write() {
-                    if let Some(entry) = presence.get_mut(&device_id) {
-                        entry.is_online = false;
-                    }
+                    presence.remove(&device_id);
                 }
             }
         }
@@ -434,6 +673,7 @@ impl RelayRuntime {
 
     pub fn emit_devices_updated(&self) {
         let _ = self.inner.app.emit("devices_updated", self.list_devices());
+        let _ = tray::refresh(&self.inner.app, self);
     }
 
     pub fn emit_sync_status_changed(&self) {
@@ -441,12 +681,110 @@ impl RelayRuntime {
             .inner
             .app
             .emit("sync_status_changed", self.sync_status_clone());
+        let _ = tray::refresh(&self.inner.app, self);
+    }
+
+    pub fn emit_transfer_jobs_updated(&self) {
+        let _ = self
+            .inner
+            .app
+            .emit("transfer_jobs_updated", self.list_transfer_jobs());
     }
 
     pub fn emit_clipboard_error(&self, message: impl Into<String>) {
         let message = message.into();
         self.set_sync_status(SyncState::Error, Some(message.clone()), None);
         let _ = self.inner.app.emit("clipboard_error", message);
+    }
+
+    fn emit_transfer_ready(&self, job: TransferJob) {
+        let _ = self.inner.app.emit("transfer_ready", job);
+    }
+
+    fn emit_transfer_failed(&self, job: TransferJob) {
+        let _ = self.inner.app.emit("transfer_failed", job);
+    }
+
+    async fn process_outbound_transfer(
+        &self,
+        transfer_id: String,
+        target: ActiveTarget,
+        paths: Vec<PathBuf>,
+        cancel_flag: Arc<AtomicBool>,
+    ) {
+        let prepared = match tauri::async_runtime::spawn_blocking(move || transfers::prepare_transfer(&paths))
+            .await
+        {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                let _ = self.fail_transfer(&transfer_id, error.to_string());
+                return;
+            }
+            Err(error) => {
+                let _ = self.fail_transfer(&transfer_id, format!("prepare transfer join error: {error}"));
+                return;
+            }
+        };
+
+        let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
+            job.display_name = prepared.display_name.clone();
+            job.total_bytes = prepared.total_bytes;
+            job.total_entries = prepared.total_entries();
+            job.entries = prepared.entries.iter().map(|entry| entry.entry.clone()).collect();
+            job.top_level_names = prepared.top_level_names.clone();
+            job.warning_message = prepared.warning_message.clone();
+        });
+
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = self.cancel_transfer(&transfer_id);
+            return;
+        }
+
+        let lease = match self.acquire_transfer_lease(&transfer_id).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = self.fail_transfer(&transfer_id, error.to_string());
+                return;
+            }
+        };
+
+        let _ = self.set_transfer_stage(&transfer_id, TransferStage::Downloading, None, true);
+        let offer = IncomingTransferOffer {
+            transfer_id: transfer_id.clone(),
+            origin_device_id: self.local_device().device_id,
+            target_device_id: target.device_id.clone(),
+            display_name: prepared.display_name.clone(),
+            total_bytes: prepared.total_bytes,
+            total_entries: prepared.total_entries(),
+            entries: prepared.entries.iter().map(|entry| entry.entry.clone()).collect(),
+            top_level_names: prepared.top_level_names.clone(),
+            warning_message: prepared.warning_message.clone(),
+        };
+
+        let result = transport::send_transfer(
+            self.clone(),
+            target.socket_addr,
+            &target.fingerprint,
+            offer,
+            prepared,
+            cancel_flag.clone(),
+        )
+        .await;
+
+        drop(lease);
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = self.cancel_transfer(&transfer_id);
+            return;
+        }
+
+        match result {
+            Ok(_) => {
+                let _ = self.complete_outbound_transfer(&transfer_id);
+            }
+            Err(error) => {
+                let _ = self.fail_transfer(&transfer_id, error.to_string());
+            }
+        }
     }
 
     fn restart_discovery(&self, enabled: bool) -> Result<()> {
@@ -484,45 +822,49 @@ impl RelayRuntime {
         Ok(())
     }
 
-    fn collect_devices(&self, persistent: &PersistentState) -> Vec<TrustedDevice> {
+    async fn acquire_transfer_lease(&self, transfer_id: &str) -> Result<TransferLease> {
+        if self.inner.transfer_gate.available_permits() == 0 {
+            let _ = self.set_transfer_stage(transfer_id, TransferStage::Queued, None, true);
+        }
+
+        let permit = self
+            .inner
+            .transfer_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .context("failed to acquire a transfer slot")?;
+        Ok(TransferLease { _permit: permit })
+    }
+
+    fn collect_devices(&self, local_device_id: &str) -> Vec<TrustedDevice> {
         let presence = self
             .inner
             .presence
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let active_device_id = self.active_device_id_clone();
 
-        let mut devices = persistent
-            .trusted_devices
+        let mut devices = presence
             .values()
-            .map(|stored| {
-                let online = presence.get(&stored.device_id);
+            .filter(|device| device.device_id != local_device_id)
+            .map(|device| {
                 TrustedDevice {
-                    device_id: stored.device_id.clone(),
-                    name: stored.name.clone(),
-                    platform: stored.platform.clone(),
-                    fingerprint: stored.fingerprint.clone(),
-                    auto_trusted: stored.auto_trusted,
-                    capabilities: stored.capabilities.clone(),
-                    last_seen: online.map(|entry| entry.last_seen).or(stored.last_seen),
-                    last_sync_at: stored.last_sync_at,
-                    last_sync_status: stored.last_sync_status.clone(),
-                    addresses: online
-                        .map(|entry| {
-                            entry
-                                .addresses
-                                .iter()
-                                .map(|address| address.to_string())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    host_name: online
-                        .and_then(|entry| entry.host_name.clone())
-                        .or_else(|| stored.host_name.clone()),
-                    port: online.map(|entry| entry.port),
-                    is_online: online.map(|entry| entry.is_online).unwrap_or(false),
-                    is_active: persistent.settings.active_device_id.as_deref()
-                        == Some(stored.device_id.as_str()),
+                    device_id: device.device_id.clone(),
+                    name: device.name.clone(),
+                    platform: device.platform.clone(),
+                    fingerprint: device.fingerprint.clone(),
+                    auto_trusted: false,
+                    capabilities: device.capabilities.clone(),
+                    last_seen: Some(device.last_seen),
+                    last_sync_at: device.last_sync_at,
+                    last_sync_status: device.last_sync_status.clone(),
+                    addresses: device.addresses.iter().map(|address| address.to_string()).collect(),
+                    host_name: device.host_name.clone(),
+                    port: Some(device.port),
+                    is_online: device.is_online,
+                    is_active: active_device_id.as_deref() == Some(device.device_id.as_str()),
                 }
             })
             .collect::<Vec<_>>();
@@ -538,11 +880,7 @@ impl RelayRuntime {
     }
 
     fn active_target(&self) -> Result<Option<ActiveTarget>> {
-        let persistent = self.persistent_clone();
-        let Some(active_device_id) = persistent.settings.active_device_id else {
-            return Ok(None);
-        };
-        let Some(stored_device) = persistent.trusted_devices.get(&active_device_id) else {
+        let Some(active_device_id) = self.active_device_id_clone() else {
             return Ok(None);
         };
 
@@ -552,24 +890,19 @@ impl RelayRuntime {
             .read()
             .map_err(|_| anyhow!("presence lock poisoned"))?;
         let Some(online) = presence.get(&active_device_id) else {
-            bail!(match self.language() {
-                AppLanguage::ZhCn => "当前活动设备不可达",
-                AppLanguage::En => "the active device is not reachable",
-            });
+            bail!("the active device is not reachable");
         };
+        if !online.is_online {
+            bail!("the active device is not reachable");
+        }
 
-        let socket_addr =
-            preferred_socket_addr(&online.addresses, online.port).ok_or_else(|| {
-                anyhow!(match self.language() {
-                    AppLanguage::ZhCn => "当前活动设备没有可用的路由地址",
-                    AppLanguage::En => "the active device has no routable address",
-                })
-            })?;
+        let socket_addr = preferred_socket_addr(&online.addresses, online.port)
+            .ok_or_else(|| anyhow!("the active device has no routable address"))?;
 
         Ok(Some(ActiveTarget {
             device_id: active_device_id,
-            name: stored_device.name.clone(),
-            fingerprint: stored_device.fingerprint.clone(),
+            name: online.name.clone(),
+            fingerprint: online.fingerprint.clone(),
             socket_addr,
         }))
     }
@@ -600,6 +933,20 @@ impl RelayRuntime {
                 certificate_der_b64: String::new(),
                 private_key_der_b64: String::new(),
             })
+    }
+
+    fn active_device_id_clone(&self) -> Option<String> {
+        self.inner
+            .active_device_id
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or(None)
+    }
+
+    fn set_active_device_id(&self, device_id: Option<String>) {
+        if let Ok(mut active_device_id) = self.inner.active_device_id.write() {
+            *active_device_id = device_id;
+        }
     }
 
     fn sync_status_clone(&self) -> SyncStatus {
@@ -651,11 +998,10 @@ impl RelayRuntime {
         status_message: String,
         payload: Option<ClipboardPayload>,
     ) {
-        if let Ok(mut persistent) = self.inner.persistent.write() {
-            if let Some(device) = persistent.trusted_devices.get_mut(device_id) {
+        if let Ok(mut presence) = self.inner.presence.write() {
+            if let Some(device) = presence.get_mut(device_id) {
                 device.last_sync_at = Some(Utc::now());
                 device.last_sync_status = Some(status_message.clone());
-                let _ = self.persist_locked(&persistent);
             }
         }
 
@@ -669,11 +1015,10 @@ impl RelayRuntime {
         status_message: String,
         payload: Option<ClipboardPayload>,
     ) {
-        if let Ok(mut persistent) = self.inner.persistent.write() {
-            if let Some(device) = persistent.trusted_devices.get_mut(device_id) {
+        if let Ok(mut presence) = self.inner.presence.write() {
+            if let Some(device) = presence.get_mut(device_id) {
                 device.last_sync_at = Some(Utc::now());
                 device.last_sync_status = Some(status_message.clone());
-                let _ = self.persist_locked(&persistent);
             }
         }
 
@@ -693,13 +1038,14 @@ impl RelayRuntime {
             return;
         }
 
-        if let Some(active_device_id) = persistent.settings.active_device_id.clone() {
-            let presence = self
-                .inner
-                .presence
-                .read()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
+        let presence = self
+            .inner
+            .presence
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        if let Some(active_device_id) = self.active_device_id_clone() {
             if let Some(entry) = presence.get(&active_device_id) {
                 if entry.is_online {
                     self.set_sync_status(
@@ -710,6 +1056,25 @@ impl RelayRuntime {
                     return;
                 }
             }
+        }
+
+        let online_peer_count = presence
+            .iter()
+            .filter(|(device_id, entry)| {
+                entry.is_online && device_id.as_str() != persistent.local_device.device_id
+            })
+            .count();
+
+        if online_peer_count > 0 {
+            self.set_sync_status(
+                SyncState::Idle,
+                Some(i18n::available_peers(
+                    persistent.settings.language,
+                    online_peer_count,
+                )),
+                payload,
+            );
+            return;
         }
 
         self.set_sync_status(
@@ -738,23 +1103,146 @@ impl RelayRuntime {
             .map(|recent_hashes| recent_hashes.iter().any(|entry| entry == hash))
             .unwrap_or(false)
     }
-}
 
-#[derive(Clone)]
-struct ActiveTarget {
-    device_id: String,
-    name: String,
-    fingerprint: String,
-    socket_addr: SocketAddr,
-}
+    fn find_transfer_job(&self, transfer_id: &str) -> Option<TransferJob> {
+        self.inner
+            .transfer_jobs
+            .read()
+            .ok()
+            .and_then(|jobs| jobs.iter().find(|job| job.transfer_id == transfer_id).cloned())
+    }
 
-fn is_private_ip(address: &IpAddr) -> bool {
-    match address {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || *ip == Ipv4Addr::LOCALHOST,
-        IpAddr::V6(ip) => {
-            ip.is_unique_local() || ip.is_unicast_link_local() || *ip == Ipv6Addr::LOCALHOST
+    fn upsert_transfer_job(&self, job: TransferJob, persist: bool) -> Result<()> {
+        let snapshot = {
+            let mut jobs = self
+                .inner
+                .transfer_jobs
+                .write()
+                .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
+            if let Some(existing) = jobs.iter_mut().find(|existing| existing.transfer_id == job.transfer_id)
+            {
+                *existing = job;
+            } else {
+                jobs.push(job);
+            }
+            if persist { Some(jobs.clone()) } else { None }
+        };
+
+        if let Some(snapshot) = snapshot {
+            store::save_transfer_jobs(&self.inner.state_path, &snapshot)?;
+            self.emit_transfer_jobs(snapshot);
+        } else {
+            self.emit_transfer_jobs_updated();
+        }
+        Ok(())
+    }
+
+    fn mutate_transfer_job<F>(
+        &self,
+        transfer_id: &str,
+        persist: bool,
+        apply: F,
+    ) -> Result<Option<TransferJob>>
+    where
+        F: FnOnce(&mut TransferJob),
+    {
+        let (updated, snapshot) = {
+            let mut jobs = self
+                .inner
+                .transfer_jobs
+                .write()
+                .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
+            let updated = jobs.iter_mut().find(|job| job.transfer_id == transfer_id).map(|job| {
+                apply(job);
+                job.clone()
+            });
+            let snapshot = if persist { Some(jobs.clone()) } else { None };
+            (updated, snapshot)
+        };
+
+        if let Some(snapshot) = snapshot {
+            store::save_transfer_jobs(&self.inner.state_path, &snapshot)?;
+            self.emit_transfer_jobs(snapshot);
+        } else {
+            self.emit_transfer_jobs_updated();
+        }
+        Ok(updated)
+    }
+
+    fn set_transfer_stage(
+        &self,
+        transfer_id: &str,
+        stage: TransferStage,
+        staging_path: Option<String>,
+        persist: bool,
+    ) -> Result<Option<TransferJob>> {
+        self.mutate_transfer_job(transfer_id, persist, move |job| {
+            job.stage = stage.clone();
+            if let Some(staging_path) = staging_path.clone() {
+                job.staging_path = Some(staging_path);
+            }
+            if matches!(stage, TransferStage::Failed | TransferStage::Canceled | TransferStage::Ready) {
+                job.finished_at = Some(Utc::now());
+            }
+        })
+    }
+
+    fn finish_transfer<F>(
+        &self,
+        transfer_id: &str,
+        stage: TransferStage,
+        error_message: Option<String>,
+        apply: F,
+    ) -> Result<Option<TransferJob>>
+    where
+        F: FnOnce(&mut TransferJob),
+    {
+        let updated = self.mutate_transfer_job(transfer_id, true, move |job| {
+            if job.stage == TransferStage::Canceled && stage != TransferStage::Canceled {
+                return;
+            }
+            job.stage = stage.clone();
+            job.finished_at = Some(Utc::now());
+            job.error_message = error_message.clone();
+            apply(job);
+        })?;
+
+        if let Ok(mut controls) = self.inner.transfer_controls.lock() {
+            controls.remove(transfer_id);
+        }
+
+        Ok(updated)
+    }
+
+    fn register_transfer_control(&self, transfer_id: String, cancel: Arc<AtomicBool>) {
+        if let Ok(mut controls) = self.inner.transfer_controls.lock() {
+            controls.insert(transfer_id, cancel);
         }
     }
+
+    fn emit_transfer_jobs(&self, jobs: Vec<TransferJob>) {
+        let _ = self.inner.app.emit("transfer_jobs_updated", jobs);
+    }
+}
+
+fn transfer_sort_rank(job: &TransferJob) -> (u8, u8) {
+    let primary = match (&job.stage, &job.direction, &job.ready_action_state) {
+        (TransferStage::Ready, TransferDirection::Inbound, ReadyActionState::PendingPrompt) => 0,
+        (TransferStage::Downloading, _, _) => 1,
+        (TransferStage::Verifying, _, _) => 2,
+        (TransferStage::Preparing, _, _) => 3,
+        (TransferStage::Queued, _, _) => 4,
+        (TransferStage::Failed, _, _) => 5,
+        (TransferStage::Canceled, _, _) => 6,
+        (TransferStage::Ready, _, _) => 7,
+    };
+
+    let secondary = match job.direction {
+        TransferDirection::Inbound => 0,
+        TransferDirection::Outbound => 1,
+    };
+
+    (primary, secondary)
 }
 
 fn preferred_socket_addr(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> {
@@ -778,4 +1266,10 @@ fn preferred_socket_addr(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> 
             })
         })
         .map(|address| SocketAddr::new(*address, port))
+}
+
+fn relative_path_to_native(relative_path: &str) -> PathBuf {
+    relative_path
+        .split('/')
+        .fold(PathBuf::new(), |path, segment| path.join(segment))
 }

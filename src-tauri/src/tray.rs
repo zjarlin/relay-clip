@@ -3,16 +3,18 @@ use crate::runtime::RelayRuntime;
 use anyhow::{anyhow, Result};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{image::Image, AppHandle, Manager};
 
 const TRAY_ID: &str = "relayclip-tray";
 
 pub fn setup(app: &AppHandle, relay: RelayRuntime) -> Result<()> {
     let menu = build_menu(app, &relay)?;
+    let tray_icon = Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
     let relay_for_menu = relay.clone();
     let relay_for_click = relay.clone();
 
     TrayIconBuilder::with_id(TRAY_ID)
+        .icon(tray_icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| {
@@ -69,6 +71,12 @@ pub fn refresh(app: &AppHandle, relay: &RelayRuntime) -> Result<()> {
 fn build_menu(app: &AppHandle, relay: &RelayRuntime) -> Result<tauri::menu::Menu<tauri::Wry>> {
     let snapshot = relay.snapshot()?;
     let language = snapshot.settings.language;
+    let visible_devices = snapshot
+        .devices
+        .iter()
+        .filter(|device| device.is_online)
+        .cloned()
+        .collect::<Vec<_>>();
     let active_name = snapshot
         .devices
         .iter()
@@ -86,11 +94,11 @@ fn build_menu(app: &AppHandle, relay: &RelayRuntime) -> Result<tauri::menu::Menu
     builder = builder.separator();
 
     let mut device_submenu = SubmenuBuilder::new(app, i18n::tray_devices(language));
-    if snapshot.devices.is_empty() {
+    if visible_devices.is_empty() {
         device_submenu =
             device_submenu.text("device:none", i18n::tray_waiting_for_devices(language));
     } else {
-        for device in snapshot.devices {
+        for device in visible_devices {
             let label = if device.is_active {
                 format!("* {}", device.name)
             } else {

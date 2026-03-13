@@ -1,163 +1,201 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
+    cancelTransferJob,
+    dismissTransferJob,
     getAppState,
     isAutostartEnabled,
+    listTransferJobs,
     onClipboardError,
     onDevicesUpdated,
     onSyncStatusChanged,
+    onTransferJobsUpdated,
+    onTransferReady,
+    placeReceivedTransferOnClipboard,
     setActiveDevice,
     syncAutostart,
     toggleSync,
     updateSettings,
   } from './lib/api'
-  import { getMessages, languageLabel, normalizeLanguage } from './lib/i18n'
-  import type { AppLanguage, AppStateSnapshot, SyncStatus } from './lib/types'
-
-  const languageOptions: AppLanguage[] = ['en', 'zh-CN']
+  import { getMessages, normalizeLanguage } from './lib/i18n'
+  import type { AppStateSnapshot, TransferJob } from './lib/types'
+  import {
+    isPermissionGranted,
+    requestPermission,
+    sendNotification,
+  } from '@tauri-apps/plugin-notification'
 
   let snapshot: AppStateSnapshot | null = null
-  let selectedPane: 'overview' | 'device' = 'overview'
-  let selectedDeviceId: string | null = null
-  let busy = false
+  let transferJobs: TransferJob[] = []
+  let busyTransferId: string | null = null
+  let settingsBusy = false
   let errorBanner: string | null = null
+  const notifiedReady = new Set<string>()
 
   $: currentLanguage =
     snapshot?.settings.language ??
     normalizeLanguage(typeof navigator === 'undefined' ? undefined : navigator.language)
   $: copy = getMessages(currentLanguage)
   $: devices = snapshot?.devices ?? []
+  $: activeDevice = devices.find((device) => device.isActive) ?? null
+  $: nearbyDevices = devices.filter(
+    (device) =>
+      !device.isActive &&
+      device.isOnline &&
+      device.deviceId !== (snapshot?.localDevice.deviceId ?? ''),
+  )
+  $: visibleTransferJobs = transferJobs
   $: syncStatus = snapshot?.syncStatus
-  $: selectedDevice =
-    devices.find((device) => device.deviceId === selectedDeviceId) ??
-    devices.find((device) => device.isActive) ??
-    null
-  $: if (!selectedDevice && devices.length === 0) {
-    selectedPane = 'overview'
-  }
-
-  function applySnapshot(next: AppStateSnapshot) {
-    snapshot = next
-
-    if (!selectedDeviceId) {
-      selectedDeviceId = next.settings.activeDeviceId ?? next.devices[0]?.deviceId ?? null
-    }
-
-    if (
-      selectedDeviceId &&
-      !next.devices.some((device) => device.deviceId === selectedDeviceId)
-    ) {
-      selectedDeviceId = next.settings.activeDeviceId ?? next.devices[0]?.deviceId ?? null
-    }
-  }
 
   async function refresh() {
-    const state = await getAppState()
-    applySnapshot(state)
+    const [state, jobs] = await Promise.all([getAppState(), listTransferJobs()])
+    snapshot = state
+    transferJobs = jobs
 
-    const autostartEnabled = await isAutostartEnabled().catch(() => state.settings.launchOnLogin)
-    if (autostartEnabled !== state.settings.launchOnLogin) {
-      const corrected = await updateSettings({ launchOnLogin: autostartEnabled })
-      applySnapshot(corrected)
+    try {
+      let shouldPersistAutostart = state.settings.launchOnLogin !== true
+      const autostartEnabled = await isAutostartEnabled().catch(() => state.settings.launchOnLogin)
+      if (!autostartEnabled) {
+        await syncAutostart(true)
+        shouldPersistAutostart = true
+      }
+      if (shouldPersistAutostart) {
+        snapshot = await updateSettings({ launchOnLogin: true })
+      }
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
     }
   }
 
   async function patchSettings(patch: Parameters<typeof updateSettings>[0]) {
-    busy = true
+    if (!snapshot) return
+    settingsBusy = true
     errorBanner = null
 
     try {
-      if (typeof patch.launchOnLogin === 'boolean') {
-        await syncAutostart(patch.launchOnLogin)
-      }
-
-      const next = await updateSettings(patch)
-      applySnapshot(next)
+      snapshot = await updateSettings(patch)
     } catch (error) {
       errorBanner = error instanceof Error ? error.message : String(error)
     } finally {
-      busy = false
+      settingsBusy = false
     }
   }
 
-  async function changeActiveDevice(deviceId: string) {
-    busy = true
+  async function pairDevice(deviceId: string) {
     errorBanner = null
-
     try {
-      const next = await setActiveDevice(deviceId)
-      selectedPane = 'device'
-      selectedDeviceId = deviceId
-      applySnapshot(next)
+      snapshot = await setActiveDevice(deviceId)
     } catch (error) {
       errorBanner = error instanceof Error ? error.message : String(error)
-    } finally {
-      busy = false
     }
   }
 
-  async function flipSync(enabled: boolean) {
-    busy = true
+  async function toggleClipboardSync(enabled: boolean) {
     errorBanner = null
-
     try {
-      const next = await toggleSync(enabled)
-      applySnapshot(next)
+      snapshot = await toggleSync(enabled)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  async function placeTransfer(job: TransferJob) {
+    busyTransferId = job.transferId
+    errorBanner = null
+    try {
+      await placeReceivedTransferOnClipboard(job.transferId)
     } catch (error) {
       errorBanner = error instanceof Error ? error.message : String(error)
     } finally {
-      busy = false
+      busyTransferId = null
     }
   }
 
-  function statusTone(status?: SyncStatus) {
-    switch (status?.state) {
-      case 'connected':
-        return 'good'
-      case 'syncing':
-        return 'live'
-      case 'paused':
-        return 'muted'
-      case 'error':
-        return 'danger'
-      default:
-        return 'default'
+  async function dismissTransfer(job: TransferJob) {
+    busyTransferId = job.transferId
+    errorBanner = null
+    try {
+      await dismissTransferJob(job.transferId)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyTransferId = null
     }
   }
 
-  function prettyDate(value: string | null | undefined) {
-    if (!value) {
-      return copy.never
+  async function cancelTransfer(job: TransferJob) {
+    busyTransferId = job.transferId
+    errorBanner = null
+    try {
+      await cancelTransferJob(job.transferId)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyTransferId = null
+    }
+  }
+
+  async function notifyTransferReady(job: TransferJob) {
+    if (notifiedReady.has(job.transferId)) return
+    notifiedReady.add(job.transferId)
+
+    let permissionGranted = await isPermissionGranted()
+    if (!permissionGranted) {
+      const permission = await requestPermission()
+      permissionGranted = permission === 'granted'
     }
 
-    const date = new Date(value)
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleString(currentLanguage)
+    if (permissionGranted) {
+      await sendNotification({
+        title: copy.notificationTitle,
+        body: copy.notificationBody(job.displayName),
+      })
+    }
+  }
+
+  function formatBytes(value: number) {
+    if (value <= 0) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    let size = value
+    let unitIndex = 0
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024
+      unitIndex += 1
+    }
+    return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
+  }
+
+  function progress(job: TransferJob) {
+    if (job.totalBytes > 0) {
+      return Math.min(100, Math.round((job.completedBytes / job.totalBytes) * 100))
+    }
+    if (job.totalEntries > 0) {
+      return Math.min(100, Math.round((job.completedEntries / job.totalEntries) * 100))
+    }
+    return job.stage === 'ready' ? 100 : 0
   }
 
   onMount(() => {
     let disposed = false
-
     void refresh()
 
     const unlisten = Promise.all([
       onDevicesUpdated((devices) => {
-        if (!snapshot || disposed) {
-          return
-        }
-
+        if (!snapshot || disposed) return
         snapshot = { ...snapshot, devices }
       }),
       onSyncStatusChanged((status) => {
-        if (!snapshot || disposed) {
-          return
-        }
-
+        if (!snapshot || disposed) return
         snapshot = { ...snapshot, syncStatus: status }
       }),
       onClipboardError((message) => {
-        if (!disposed) {
-          errorBanner = message
-        }
+        if (!disposed) errorBanner = message
+      }),
+      onTransferJobsUpdated((jobs) => {
+        if (!disposed) transferJobs = jobs
+      }),
+      onTransferReady((job) => {
+        if (!disposed) void notifyTransferReady(job)
       }),
     ])
 
@@ -170,337 +208,166 @@
 
 {#if snapshot}
   <main class="shell">
-    <aside class="sidebar glass">
-      <div class="brand">
-        <div class="brand-mark">RC</div>
-        <div>
-          <p>RelayClip</p>
-          <small>{copy.relayHub(snapshot.localDevice.platform)}</small>
+    <section class="toolbox glass">
+      <header class="topbar">
+        <div class="title-stack">
+          <p class="eyebrow">{copy.title}</p>
+          <input
+            class="device-name-input"
+            disabled={settingsBusy}
+            on:change={(event) =>
+              patchSettings({ deviceName: (event.currentTarget as HTMLInputElement).value })}
+            spellcheck="false"
+            type="text"
+            value={snapshot.settings.deviceName}
+          />
         </div>
-      </div>
-
-      <button
-        class:selected={selectedPane === 'overview'}
-        class="nav-card"
-        on:click={() => {
-          selectedPane = 'overview'
-          selectedDeviceId = null
-        }}
-        type="button"
-      >
-        <strong>{copy.overview}</strong>
-        <span>{copy.trustedDeviceCount(devices.length)}</span>
-      </button>
-
-      <div class="device-stack">
-        <div class="stack-head">
-          <span>{copy.activePairing}</span>
-          <small>
-            {snapshot.settings.activeDeviceId ? copy.switchTarget : copy.chooseFirstDevice}
-          </small>
-        </div>
-
-        {#if devices.length === 0}
-          <div class="empty-state">
-            <strong>{copy.waitingNearbyDevices}</strong>
-            <p>{copy.waitingNearbyDevicesDesc}</p>
-          </div>
-        {:else}
-          {#each devices as device}
-            <button
-              class:selected={selectedDeviceId === device.deviceId}
-              class="device-card"
-              on:click={() => {
-                selectedPane = 'device'
-                selectedDeviceId = device.deviceId
-              }}
-              type="button"
-            >
-              <div class="device-card-top">
-                <strong>{device.name}</strong>
-                {#if device.isActive}
-                  <span class="pill accent">{copy.current}</span>
-                {/if}
-              </div>
-              <span>{device.platform}</span>
-              <small>
-                {device.isOnline ? copy.onlineNow : copy.offline} ·
-                {device.autoTrusted ? copy.autoTrusted : copy.knownPeer}
-              </small>
-            </button>
-          {/each}
-        {/if}
-      </div>
-    </aside>
-
-    <section class="workspace">
-      <header class="workspace-head glass">
-        <div>
-          <p class="eyebrow">{copy.status}</p>
-          <h1>{copy.headline}</h1>
-          <small>{copy.subheadline}</small>
-        </div>
-
-        <div class={`status-pill ${statusTone(syncStatus)}`}>
-          <span>{copy.statusState(syncStatus?.state ?? 'idle')}</span>
-          <small>{syncStatus?.message ?? copy.waitingForActivity}</small>
+        <div class={`status-pill ${syncStatus?.state ?? 'idle'}`}>
+          <strong>{copy.syncState(syncStatus?.state ?? 'idle')}</strong>
+          <small>{syncStatus?.message ?? ''}</small>
         </div>
       </header>
 
       {#if errorBanner}
-        <div class="banner error">
-          <strong>{copy.clipboardEvent}</strong>
-          <span>{errorBanner}</span>
-        </div>
+        <div class="banner">{errorBanner}</div>
       {/if}
 
-      {#if selectedPane === 'overview'}
-        <div class="panel-grid">
-          <article class="panel glass hero">
-            <div class="hero-copy">
-              <p class="eyebrow">{copy.localDevice}</p>
-              <h2>{snapshot.localDevice.deviceName}</h2>
-              <small>
-                {snapshot.localDevice.platform} · {snapshot.localDevice.protocolVersion} ·
-                {snapshot.localDevice.capabilities.join(', ')}
-              </small>
+      <section class="card glass inner">
+        <div class="section-head">
+          <span>{copy.currentPair}</span>
+        </div>
+        {#if activeDevice}
+          <article class="pair-card">
+            <div>
+              <strong>{activeDevice.name}</strong>
+              <small>{activeDevice.platform} · {activeDevice.isOnline ? copy.online : copy.offline}</small>
             </div>
-
-            <dl class="specs">
-              <div>
-                <dt>{copy.fingerprint}</dt>
-                <dd>{snapshot.localDevice.fingerprint.slice(0, 16)}...</dd>
-              </div>
-              <div>
-                <dt>{copy.lastPayload}</dt>
-                <dd>
-                  {#if syncStatus?.lastPayload}
-                    {copy.payload(
-                      syncStatus.lastPayload.kind,
-                      Math.round(syncStatus.lastPayload.size / 1024),
-                    )}
-                  {:else}
-                    {copy.noRelayYet}
-                  {/if}
-                </dd>
-              </div>
-              <div>
-                <dt>{copy.updated}</dt>
-                <dd>{prettyDate(syncStatus?.updatedAt)}</dd>
-              </div>
-            </dl>
+            <span class="pill success">{copy.activeNow}</span>
           </article>
-
-          <article class="panel glass settings">
-            <div class="panel-head">
-              <div>
-                <p class="eyebrow">{copy.preferences}</p>
-                <h2>{copy.systemBehavior}</h2>
-              </div>
-            </div>
-
-            <div class="setting-list">
-              <label class="setting-row">
-                <div>
-                  <strong>{copy.language}</strong>
-                  <small>{copy.languageDescription}</small>
-                </div>
-                <div class="segment-group" role="group" aria-label={copy.language}>
-                  {#each languageOptions as language}
-                    <button
-                      class:active={snapshot.settings.language === language}
-                      class="segment-button"
-                      disabled={busy}
-                      on:click={() => patchSettings({ language })}
-                      type="button"
-                    >
-                      {languageLabel(language)}
-                    </button>
-                  {/each}
-                </div>
-              </label>
-
-              <label class="setting-row">
-                <div>
-                  <strong>{copy.deviceName}</strong>
-                  <small>{copy.deviceNameDescription}</small>
-                </div>
-                <input
-                  disabled={busy}
-                  on:change={(event) =>
-                    patchSettings({ deviceName: (event.currentTarget as HTMLInputElement).value })
-                  }
-                  type="text"
-                  value={snapshot.settings.deviceName}
-                />
-              </label>
-
-              <label class="setting-row">
-                <div>
-                  <strong>{copy.launchOnLogin}</strong>
-                  <small>{copy.launchOnLoginDescription}</small>
-                </div>
-                <input
-                  checked={snapshot.settings.launchOnLogin}
-                  disabled={busy}
-                  on:change={(event) =>
-                    patchSettings({ launchOnLogin: (event.currentTarget as HTMLInputElement).checked })
-                  }
-                  type="checkbox"
-                />
-              </label>
-
-              <label class="setting-row">
-                <div>
-                  <strong>{copy.lanDiscovery}</strong>
-                  <small>{copy.lanDiscoveryDescription}</small>
-                </div>
-                <input
-                  checked={snapshot.settings.discoveryEnabled}
-                  disabled={busy}
-                  on:change={(event) =>
-                    patchSettings({ discoveryEnabled: (event.currentTarget as HTMLInputElement).checked })
-                  }
-                  type="checkbox"
-                />
-              </label>
-
-              <label class="setting-row">
-                <div>
-                  <strong>{copy.clipboardSync}</strong>
-                  <small>{copy.clipboardSyncDescription}</small>
-                </div>
-                <input
-                  checked={snapshot.settings.syncEnabled}
-                  disabled={busy}
-                  on:change={(event) => flipSync((event.currentTarget as HTMLInputElement).checked)}
-                  type="checkbox"
-                />
-              </label>
-            </div>
+        {:else}
+          <article class="empty-card">
+            <strong>{copy.noActivePair}</strong>
+            <small>{copy.noActivePairHint}</small>
           </article>
+        {/if}
+      </section>
 
-          <article class="panel glass roster">
-            <div class="panel-head">
-              <div>
-                <p class="eyebrow">{copy.trustedPeers}</p>
-                <h2>{copy.availableDevices}</h2>
-              </div>
-              <span class="pill">{copy.onlineCount(devices.filter((device) => device.isOnline).length)}</span>
-            </div>
+      <section class="card glass inner">
+        <div class="section-head">
+          <span>{copy.nearby}</span>
+        </div>
+        <div class="device-list">
+          {#if nearbyDevices.length === 0}
+            <article class="empty-card compact">
+              <strong>{copy.waitingDevices}</strong>
+              <small>{copy.waitingDevicesHint}</small>
+            </article>
+          {:else}
+            {#each nearbyDevices as device}
+              <article class="device-row">
+                <div class="device-meta">
+                  <strong>{device.name}</strong>
+                  <small>{device.platform}</small>
+                </div>
+                <button class="primary compact" on:click={() => pairDevice(device.deviceId)} type="button">
+                  {copy.makeActive}
+                </button>
+              </article>
+            {/each}
+          {/if}
+        </div>
+      </section>
 
-            <div class="roster-list">
-              {#each devices as device}
-                <div class="roster-row">
+      <section class="card glass inner">
+        <div class="section-head">
+          <span>{copy.transfers}</span>
+        </div>
+        <div class="transfer-list">
+          {#if visibleTransferJobs.length === 0}
+            <article class="empty-card compact">
+              <strong>{copy.noTransfers}</strong>
+            </article>
+          {:else}
+            {#each visibleTransferJobs as job}
+              <article class:ready={job.stage === 'ready' && job.readyActionState === 'pendingPrompt'} class="transfer-row">
+                <div class="transfer-top">
                   <div>
-                    <strong>{device.name}</strong>
-                    <small>{device.platform} · {device.addresses.join(', ') || copy.noAddressYet}</small>
+                    <strong>{job.displayName}</strong>
+                    <small>{copy.transferState(job.stage, job.direction)}</small>
                   </div>
-                  <div class="roster-actions">
-                    <span class={`pill ${device.isOnline ? 'accent' : ''}`}>
-                      {device.isOnline ? copy.reachable : copy.offline}
-                    </span>
+                  <small>{copy.transferSummary(job.completedEntries, job.totalEntries)}</small>
+                </div>
+
+                <div class="meter">
+                  <div class="meter-bar" style={`width: ${progress(job)}%`}></div>
+                </div>
+
+                <div class="transfer-meta">
+                  <small>{formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)}</small>
+                  {#if job.warningMessage}
+                    <small>{job.warningMessage}</small>
+                  {:else if job.errorMessage}
+                    <small>{job.errorMessage}</small>
+                  {:else if job.stage === 'ready' && job.direction === 'inbound'}
+                    <small>{copy.readyToPaste}</small>
+                  {:else if job.stage === 'ready'}
+                    <small>{copy.hiddenReadyState(job.readyActionState)}</small>
+                  {/if}
+                </div>
+
+                {#if job.stage === 'ready' && job.direction === 'inbound' && job.readyActionState === 'pendingPrompt'}
+                  <div class="action-row">
                     <button
-                      class="ghost-button"
-                      disabled={busy}
-                      on:click={() => changeActiveDevice(device.deviceId)}
+                      class="primary"
+                      disabled={busyTransferId === job.transferId}
+                      on:click={() => placeTransfer(job)}
                       type="button"
                     >
-                      {device.isActive ? copy.selected : copy.setActive}
+                      {copy.placeOnClipboard}
+                    </button>
+                    <button
+                      class="ghost"
+                      disabled={busyTransferId === job.transferId}
+                      on:click={() => dismissTransfer(job)}
+                      type="button"
+                    >
+                      {copy.dismiss}
                     </button>
                   </div>
-                </div>
-              {/each}
-            </div>
-          </article>
-        </div>
-      {:else if selectedDevice}
-        <div class="panel-grid detail">
-          <article class="panel glass hero">
-            <div class="panel-head">
-              <div>
-                <p class="eyebrow">{copy.deviceDetail}</p>
-                <h2>{selectedDevice.name}</h2>
-              </div>
-              <div class="chip-row">
-                <span class={`pill ${selectedDevice.isOnline ? 'accent' : ''}`}>
-                  {selectedDevice.isOnline ? copy.onlineNow : copy.offline}
-                </span>
-                {#if selectedDevice.isActive}
-                  <span class="pill accent">{copy.currentTarget}</span>
+                  <small class="warning">{copy.replaceWarning}</small>
+                {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
+                  <div class="action-row">
+                    <button
+                      class="ghost"
+                      disabled={busyTransferId === job.transferId}
+                      on:click={() => cancelTransfer(job)}
+                      type="button"
+                    >
+                      {copy.cancel}
+                    </button>
+                  </div>
                 {/if}
-              </div>
-            </div>
-
-            <dl class="detail-grid">
-              <div>
-                <dt>{copy.platform}</dt>
-                <dd>{selectedDevice.platform}</dd>
-              </div>
-              <div>
-                <dt>{copy.capabilities}</dt>
-                <dd>{selectedDevice.capabilities.join(', ')}</dd>
-              </div>
-              <div>
-                <dt>{copy.host}</dt>
-                <dd>{selectedDevice.hostName ?? copy.unknown}</dd>
-              </div>
-              <div>
-                <dt>{copy.port}</dt>
-                <dd>{selectedDevice.port ?? copy.pending}</dd>
-              </div>
-              <div>
-                <dt>{copy.lastSeen}</dt>
-                <dd>{prettyDate(selectedDevice.lastSeen)}</dd>
-              </div>
-              <div>
-                <dt>{copy.lastSync}</dt>
-                <dd>{selectedDevice.lastSyncStatus ?? copy.noSyncHistoryYet}</dd>
-              </div>
-            </dl>
-          </article>
-
-          <article class="panel glass settings">
-            <div class="panel-head">
-              <div>
-                <p class="eyebrow">{copy.routing}</p>
-                <h2>{copy.pairThisDevice}</h2>
-              </div>
-            </div>
-
-            <p class="detail-copy">{copy.routingDescription}</p>
-
-            <div class="action-row">
-              <button
-                class="primary-button"
-                disabled={busy || selectedDevice.isActive}
-                on:click={() => changeActiveDevice(selectedDevice.deviceId)}
-                type="button"
-              >
-                {selectedDevice.isActive ? copy.alreadyActive : copy.makeActiveDevice}
-              </button>
-
-              <button
-                class="ghost-button"
-                on:click={() => {
-                  selectedPane = 'overview'
-                  selectedDeviceId = null
-                }}
-                type="button"
-              >
-                {copy.backToOverview}
-              </button>
-            </div>
-          </article>
+              </article>
+            {/each}
+          {/if}
         </div>
-      {/if}
+      </section>
+
+      <footer class="card glass inner footer">
+        <label class="toggle-row">
+          <span>{copy.syncEnabled}</span>
+          <input
+            checked={snapshot.settings.syncEnabled}
+            disabled={settingsBusy}
+            on:change={(event) => toggleClipboardSync((event.currentTarget as HTMLInputElement).checked)}
+            type="checkbox"
+          />
+        </label>
+      </footer>
     </section>
   </main>
 {:else}
   <main class="loading">
-    <div class="loader glass">
-      <strong>{copy.loadingTitle}</strong>
-      <small>{copy.loadingSubtitle}</small>
-    </div>
+    <div class="glass loader">RelayClip</div>
   </main>
 {/if}

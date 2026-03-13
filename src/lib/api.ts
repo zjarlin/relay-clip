@@ -9,6 +9,7 @@ import type {
   AppStateSnapshot,
   SettingsPatch,
   SyncStatus,
+  TransferJob,
   TrustedDevice,
 } from './types'
 
@@ -32,6 +33,22 @@ export function updateSettings(patch: SettingsPatch) {
   return invoke<AppStateSnapshot>('update_settings', { patch })
 }
 
+export function listTransferJobs() {
+  return invoke<TransferJob[]>('list_transfer_jobs')
+}
+
+export function placeReceivedTransferOnClipboard(transferId: string) {
+  return invoke<void>('place_received_transfer_on_clipboard', { transferId })
+}
+
+export function dismissTransferJob(transferId: string) {
+  return invoke<void>('dismiss_transfer_job', { transferId })
+}
+
+export function cancelTransferJob(transferId: string) {
+  return invoke<void>('cancel_transfer_job', { transferId })
+}
+
 export function onDevicesUpdated(handler: (devices: TrustedDevice[]) => void) {
   return listen<TrustedDevice[]>('devices_updated', (event) => handler(event.payload))
 }
@@ -42,6 +59,18 @@ export function onSyncStatusChanged(handler: (status: SyncStatus) => void) {
 
 export function onClipboardError(handler: (message: string) => void) {
   return listen<string>('clipboard_error', (event) => handler(event.payload))
+}
+
+export function onTransferJobsUpdated(handler: (jobs: TransferJob[]) => void) {
+  return listen<TransferJob[]>('transfer_jobs_updated', (event) => handler(event.payload))
+}
+
+export function onTransferReady(handler: (job: TransferJob) => void) {
+  return listen<TransferJob>('transfer_ready', (event) => handler(event.payload))
+}
+
+export function onTransferFailed(handler: (job: TransferJob) => void) {
+  return listen<TransferJob>('transfer_failed', (event) => handler(event.payload))
 }
 
 export async function syncAutostart(enabled: boolean) {

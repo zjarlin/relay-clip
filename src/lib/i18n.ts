@@ -1,5 +1,7 @@
 import type {
   AppLanguage,
+  ClipboardHistoryKind,
+  ClipboardHistorySource,
   ReadyActionState,
   SyncState,
   TransferDirection,
@@ -20,13 +22,15 @@ export interface Messages {
   offline: string
   transfers: string
   noTransfers: string
+  clipboardHistory: string
+  noClipboardHistory: string
+  restoreHistory: string
+  openCacheDirectory: string
   readyToPaste: string
   placeOnClipboard: string
   dismiss: string
   cancel: string
-  launchOnLogin: string
   syncEnabled: string
-  deviceName: string
   saving: string
   syncState(state: SyncState): string
   transferState(stage: TransferStage, direction: TransferDirection): string
@@ -35,6 +39,8 @@ export interface Messages {
   notificationBody(name: string): string
   replaceWarning: string
   hiddenReadyState(state: ReadyActionState): string
+  historyKind(kind: ClipboardHistoryKind, fileCount: number | null): string
+  historySource(source: ClipboardHistorySource): string
 }
 
 const english: Messages = {
@@ -51,13 +57,15 @@ const english: Messages = {
   offline: 'Offline',
   transfers: 'Transfers',
   noTransfers: 'No file relays yet.',
+  clipboardHistory: 'Clipboard history',
+  noClipboardHistory: 'No clipboard history yet.',
+  restoreHistory: 'Copy again',
+  openCacheDirectory: 'Open cache',
   readyToPaste: 'Ready to place on clipboard',
   placeOnClipboard: 'Place on clipboard',
   dismiss: 'Dismiss',
   cancel: 'Cancel',
-  launchOnLogin: 'Launch on login',
   syncEnabled: 'Clipboard sync',
-  deviceName: 'Device name',
   saving: 'Saving...',
   syncState: (state) =>
     ({
@@ -94,6 +102,18 @@ const english: Messages = {
       dismissed: 'Dismissed',
       placed: 'Placed',
     })[state],
+  historyKind: (kind, fileCount) =>
+    ({
+      text: 'Text',
+      image: 'Image',
+      fileRefs: fileCount && fileCount > 1 ? `${fileCount} files` : 'File',
+    })[kind],
+  historySource: (source) =>
+    ({
+      local: 'Local copy',
+      remote: 'Received clip',
+      transfer: 'Received files',
+    })[source],
 }
 
 const chinese: Messages = {
@@ -110,13 +130,15 @@ const chinese: Messages = {
   offline: '离线',
   transfers: '文件接力',
   noTransfers: '还没有文件接力任务。',
+  clipboardHistory: '剪贴板历史',
+  noClipboardHistory: '还没有剪贴板历史。',
+  restoreHistory: '再次复制',
+  openCacheDirectory: '打开缓存目录',
   readyToPaste: '已下载完成，可放入剪贴板',
   placeOnClipboard: '放入剪贴板',
   dismiss: '忽略',
   cancel: '取消',
-  launchOnLogin: '开机启动',
   syncEnabled: '剪贴板同步',
-  deviceName: '设备名称',
   saving: '保存中...',
   syncState: (state) =>
     ({
@@ -153,6 +175,18 @@ const chinese: Messages = {
       dismissed: '已忽略',
       placed: '已放入',
     })[state],
+  historyKind: (kind, fileCount) =>
+    ({
+      text: '文本',
+      image: '图片',
+      fileRefs: fileCount && fileCount > 1 ? `${fileCount} 个文件` : '文件',
+    })[kind],
+  historySource: (source) =>
+    ({
+      local: '本机复制',
+      remote: '远端接力',
+      transfer: '接收文件',
+    })[source],
 }
 
 export function normalizeLanguage(input?: string | null): AppLanguage {

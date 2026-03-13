@@ -1,5 +1,7 @@
 export type PayloadKind = 'text' | 'image'
 export type AppLanguage = 'en' | 'zh-CN'
+export type ClipboardHistoryKind = 'text' | 'image' | 'fileRefs'
+export type ClipboardHistorySource = 'local' | 'remote' | 'transfer'
 
 export type SyncState =
   | 'idle'
@@ -45,6 +47,22 @@ export interface ClipboardPayload {
   mime: string
   size: number
   hash: string
+}
+
+export interface ClipboardHistoryEntry {
+  entryId: string
+  kind: ClipboardHistoryKind
+  source: ClipboardHistorySource
+  displayName: string
+  previewText: string | null
+  mime: string | null
+  hash: string
+  size: number
+  fileCount: number | null
+  createdAt: string
+  payloadPath: string | null
+  transferId: string | null
+  topLevelNames: string[]
 }
 
 export interface TrustedDevice {

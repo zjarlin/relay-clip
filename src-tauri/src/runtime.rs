@@ -2,7 +2,8 @@ use crate::clipboard::{self, ClipboardPacket};
 use crate::discovery::{self, DiscoveryHandle};
 use crate::i18n;
 use crate::models::{
-    AppLanguage, AppSettings, AppStateSnapshot, ClipboardPayload, LocalDevice, PersistentState,
+    AppLanguage, AppSettings, AppStateSnapshot, ClipboardHistoryEntry, ClipboardHistoryKind,
+    ClipboardHistorySource, ClipboardPayload, ClipboardPayloadKind, LocalDevice, PersistentState,
     ReadyActionState, SettingsPatch, SyncState, SyncStatus, TransferDirection, TransferJob,
     TransferKind, TransferStage, TrustedDevice,
 };
@@ -57,6 +58,7 @@ struct RuntimeInner {
     state_path: PathBuf,
     persistent: RwLock<PersistentState>,
     transfer_jobs: RwLock<Vec<TransferJob>>,
+    clipboard_history: RwLock<Vec<ClipboardHistoryEntry>>,
     presence: RwLock<HashMap<String, DevicePresence>>,
     active_device_id: RwLock<Option<String>>,
     service_map: Mutex<HashMap<String, String>>,
@@ -97,8 +99,10 @@ impl RelayRuntime {
     pub fn new(app: AppHandle) -> Result<Self> {
         let (state_path, persistent) = store::load_or_create()?;
         let mut transfer_jobs = store::load_transfer_jobs(&state_path)?;
+        let mut clipboard_history = store::load_clipboard_history(&state_path)?;
         store::cleanup_transfer_artifacts(&state_path, &mut transfer_jobs)?;
         store::save_transfer_jobs(&state_path, &transfer_jobs)?;
+        store::save_clipboard_history(&state_path, &clipboard_history)?;
 
         let language = persistent.settings.language;
         let sync_status = if persistent.settings.sync_enabled {
@@ -113,6 +117,7 @@ impl RelayRuntime {
                 state_path,
                 persistent: RwLock::new(persistent),
                 transfer_jobs: RwLock::new(transfer_jobs),
+                clipboard_history: RwLock::new(std::mem::take(&mut clipboard_history)),
                 presence: RwLock::new(HashMap::new()),
                 active_device_id: RwLock::new(None),
                 service_map: Mutex::new(HashMap::new()),
@@ -146,6 +151,7 @@ impl RelayRuntime {
         self.emit_devices_updated();
         self.emit_sync_status_changed();
         self.emit_transfer_jobs_updated();
+        self.emit_clipboard_history_updated();
         Ok(())
     }
 
@@ -192,6 +198,14 @@ impl RelayRuntime {
                 .then(right.started_at.cmp(&left.started_at))
         });
         jobs
+    }
+
+    pub fn list_clipboard_history(&self) -> Vec<ClipboardHistoryEntry> {
+        self.inner
+            .clipboard_history
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_active_device(&self, device_id: String) -> Result<AppStateSnapshot> {
@@ -300,6 +314,7 @@ impl RelayRuntime {
         }
 
         self.remember_hash(packet.meta.hash.clone());
+        let _ = self.record_packet_history(&packet, ClipboardHistorySource::Local);
 
         let target = match self.active_target() {
             Ok(Some(target)) => target,
@@ -355,6 +370,7 @@ impl RelayRuntime {
         }
 
         self.remember_hash(file_list.hash.clone());
+        let _ = self.record_local_file_history(&file_list);
 
         let target = match self.active_target() {
             Ok(Some(target)) => target,
@@ -433,6 +449,7 @@ impl RelayRuntime {
         })
         .await
         .map_err(|error| anyhow!("clipboard write join error: {error}"))??;
+        let _ = self.record_packet_history(&packet, ClipboardHistorySource::Remote);
 
         self.record_device_sync(
             &envelope.origin_device_id,
@@ -515,6 +532,7 @@ impl RelayRuntime {
             job.ready_to_paste = true;
             job.ready_action_state = ReadyActionState::PendingPrompt;
         })? {
+            let _ = self.record_received_transfer_history(&job);
             self.emit_transfer_ready(job);
         }
         Ok(())
@@ -613,6 +631,83 @@ impl RelayRuntime {
         self.cancel_transfer(&transfer_id)
     }
 
+    pub fn restore_clipboard_history_entry(&self, entry_id: String) -> Result<()> {
+        let entry = self
+            .list_clipboard_history()
+            .into_iter()
+            .find(|entry| entry.entry_id == entry_id)
+            .ok_or_else(|| anyhow!("clipboard history entry not found"))?;
+
+        match entry.kind {
+            ClipboardHistoryKind::Text | ClipboardHistoryKind::Image => {
+                let payload_path = entry
+                    .payload_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("clipboard payload is missing"))?;
+                let bytes = std::fs::read(payload_path)
+                    .with_context(|| format!("failed to read {}", payload_path))?;
+                let kind = match entry.kind {
+                    ClipboardHistoryKind::Text => ClipboardPayloadKind::Text,
+                    ClipboardHistoryKind::Image => ClipboardPayloadKind::Image,
+                    ClipboardHistoryKind::FileRefs => unreachable!(),
+                };
+                let packet = clipboard::packet_from_remote(
+                    kind,
+                    entry
+                        .mime
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    entry.hash.clone(),
+                    bytes,
+                )?;
+                self.remember_hash(entry.hash.clone());
+                clipboard::write_remote(&packet)?;
+            }
+            ClipboardHistoryKind::FileRefs => {
+                let paths = self.restore_file_history_paths(&entry)?;
+                if paths.is_empty() {
+                    bail!("no files are available to restore");
+                }
+                self.remember_hash(entry.hash.clone());
+                clipboard::write_file_list(&paths)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn open_cache_directory(&self) -> Result<()> {
+        let cache_root = store::cache_root_path(&self.inner.state_path);
+        std::fs::create_dir_all(&cache_root)
+            .with_context(|| format!("failed to create {}", cache_root.display()))?;
+
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("explorer")
+                .arg(&cache_root)
+                .spawn()
+                .context("failed to open cache directory")?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+                .arg(&cache_root)
+                .spawn()
+                .context("failed to open cache directory")?;
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(&cache_root)
+                .spawn()
+                .context("failed to open cache directory")?;
+        }
+
+        Ok(())
+    }
+
     pub fn upsert_discovered_device(&self, peer: DiscoveredPeer) -> Result<()> {
         if peer.protocol_version != crate::models::PROTOCOL_VERSION {
             return Ok(());
@@ -691,6 +786,13 @@ impl RelayRuntime {
             .emit("transfer_jobs_updated", self.list_transfer_jobs());
     }
 
+    pub fn emit_clipboard_history_updated(&self) {
+        let _ = self
+            .inner
+            .app
+            .emit("clipboard_history_updated", self.list_clipboard_history());
+    }
+
     pub fn emit_clipboard_error(&self, message: impl Into<String>) {
         let message = message.into();
         self.set_sync_status(SyncState::Error, Some(message.clone()), None);
@@ -703,6 +805,159 @@ impl RelayRuntime {
 
     fn emit_transfer_failed(&self, job: TransferJob) {
         let _ = self.inner.app.emit("transfer_failed", job);
+    }
+
+    fn record_packet_history(
+        &self,
+        packet: &ClipboardPacket,
+        source: ClipboardHistorySource,
+    ) -> Result<()> {
+        let entry_id = Uuid::new_v4().to_string();
+        let entry_dir = store::clipboard_history_entry_dir(&self.inner.state_path, &entry_id);
+        std::fs::create_dir_all(&entry_dir)
+            .with_context(|| format!("failed to create {}", entry_dir.display()))?;
+
+        let (filename, display_name, preview_text) = match packet.meta.kind {
+            ClipboardPayloadKind::Text => (
+                "payload.txt",
+                "Text clip".to_string(),
+                String::from_utf8(packet.bytes.clone())
+                    .ok()
+                    .map(|text| summarize_text(&text)),
+            ),
+            ClipboardPayloadKind::Image => ("payload.png", "Image clip".to_string(), None),
+        };
+        let payload_path = entry_dir.join(filename);
+        std::fs::write(&payload_path, &packet.bytes)
+            .with_context(|| format!("failed to write {}", payload_path.display()))?;
+
+        self.push_clipboard_history(ClipboardHistoryEntry {
+            entry_id,
+            kind: match packet.meta.kind {
+                ClipboardPayloadKind::Text => ClipboardHistoryKind::Text,
+                ClipboardPayloadKind::Image => ClipboardHistoryKind::Image,
+            },
+            source,
+            display_name,
+            preview_text,
+            mime: Some(packet.meta.mime.clone()),
+            hash: packet.meta.hash.clone(),
+            size: packet.meta.size as u64,
+            file_count: None,
+            created_at: Utc::now(),
+            payload_path: Some(payload_path.to_string_lossy().into_owned()),
+            transfer_id: None,
+            top_level_names: Vec::new(),
+        })
+    }
+
+    fn record_local_file_history(&self, file_list: &LocalFileClipboard) -> Result<()> {
+        let entry_id = Uuid::new_v4().to_string();
+        let entry_dir = store::clipboard_history_entry_dir(&self.inner.state_path, &entry_id);
+        std::fs::create_dir_all(&entry_dir)
+            .with_context(|| format!("failed to create {}", entry_dir.display()))?;
+        let payload_path = entry_dir.join("paths.json");
+        let serialized_paths = file_list
+            .paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        std::fs::write(&payload_path, serde_json::to_vec_pretty(&serialized_paths)?)
+            .with_context(|| format!("failed to write {}", payload_path.display()))?;
+
+        self.push_clipboard_history(ClipboardHistoryEntry {
+            entry_id,
+            kind: ClipboardHistoryKind::FileRefs,
+            source: ClipboardHistorySource::Local,
+            display_name: file_list.display_name.clone(),
+            preview_text: None,
+            mime: None,
+            hash: file_list.hash.clone(),
+            size: 0,
+            file_count: Some(file_list.paths.len() as u32),
+            created_at: Utc::now(),
+            payload_path: Some(payload_path.to_string_lossy().into_owned()),
+            transfer_id: None,
+            top_level_names: file_list
+                .paths
+                .iter()
+                .map(|path| {
+                    path.file_name()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+                })
+                .collect(),
+        })
+    }
+
+    fn record_received_transfer_history(&self, job: &TransferJob) -> Result<()> {
+        if job.direction != TransferDirection::Inbound {
+            return Ok(());
+        }
+
+        self.push_clipboard_history(ClipboardHistoryEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            kind: ClipboardHistoryKind::FileRefs,
+            source: ClipboardHistorySource::Transfer,
+            display_name: job.display_name.clone(),
+            preview_text: None,
+            mime: None,
+            hash: format!("transfer:{}", job.transfer_id),
+            size: job.total_bytes,
+            file_count: Some(job.total_entries),
+            created_at: Utc::now(),
+            payload_path: job.staging_path.clone(),
+            transfer_id: Some(job.transfer_id.clone()),
+            top_level_names: job.top_level_names.clone(),
+        })
+    }
+
+    fn restore_file_history_paths(&self, entry: &ClipboardHistoryEntry) -> Result<Vec<PathBuf>> {
+        match entry.source {
+            ClipboardHistorySource::Transfer => {
+                let Some(staging_path) = entry.payload_path.as_deref() else {
+                    return Ok(Vec::new());
+                };
+                let payload_root = transfers::transfer_payload_dir(Path::new(staging_path));
+                Ok(entry
+                    .top_level_names
+                    .iter()
+                    .map(|name| payload_root.join(name))
+                    .filter(|path| path.exists())
+                    .collect())
+            }
+            ClipboardHistorySource::Local | ClipboardHistorySource::Remote => {
+                let payload_path = entry
+                    .payload_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("clipboard file list is missing"))?;
+                let content = std::fs::read_to_string(payload_path)
+                    .with_context(|| format!("failed to read {}", payload_path))?;
+                let stored_paths: Vec<String> = serde_json::from_str(&content)
+                    .with_context(|| format!("failed to parse {}", payload_path))?;
+                Ok(stored_paths
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .filter(|path| path.exists())
+                    .collect())
+            }
+        }
+    }
+
+    fn push_clipboard_history(&self, entry: ClipboardHistoryEntry) -> Result<()> {
+        let snapshot = {
+            let mut entries = self
+                .inner
+                .clipboard_history
+                .write()
+                .map_err(|_| anyhow!("clipboard history lock poisoned"))?;
+            entries.retain(|existing| existing.hash != entry.hash || existing.kind != entry.kind);
+            entries.insert(0, entry);
+            store::save_clipboard_history(&self.inner.state_path, &entries)?;
+            entries.clone()
+        };
+        self.emit_clipboard_history(snapshot);
+        Ok(())
     }
 
     async fn process_outbound_transfer(
@@ -1223,6 +1478,10 @@ impl RelayRuntime {
     fn emit_transfer_jobs(&self, jobs: Vec<TransferJob>) {
         let _ = self.inner.app.emit("transfer_jobs_updated", jobs);
     }
+
+    fn emit_clipboard_history(&self, entries: Vec<ClipboardHistoryEntry>) {
+        let _ = self.inner.app.emit("clipboard_history_updated", entries);
+    }
 }
 
 fn transfer_sort_rank(job: &TransferJob) -> (u8, u8) {
@@ -1272,4 +1531,18 @@ fn relative_path_to_native(relative_path: &str) -> PathBuf {
     relative_path
         .split('/')
         .fold(PathBuf::new(), |path, segment| path.join(segment))
+}
+
+fn summarize_text(text: &str) -> String {
+    let condensed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = condensed.trim();
+    if trimmed.is_empty() {
+        return "Empty text".to_string();
+    }
+
+    let mut summary = trimmed.chars().take(80).collect::<String>();
+    if trimmed.chars().count() > 80 {
+        summary.push_str("...");
+    }
+    summary
 }

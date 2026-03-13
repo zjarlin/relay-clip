@@ -326,6 +326,8 @@ fn available_space(path: &Path) -> Result<Option<u64>> {
             return Ok(None);
         }
         let stat = unsafe { stat.assume_init() };
-        return Ok(Some(stat.f_bavail.saturating_mul(stat.f_frsize.into())));
+        let available_blocks = stat.f_bavail as u64;
+        let fragment_size = stat.f_frsize as u64;
+        return Ok(Some(available_blocks.saturating_mul(fragment_size)));
     }
 }

@@ -8,7 +8,7 @@ mod transport;
 mod transfers;
 mod tray;
 
-use crate::models::{AppStateSnapshot, SettingsPatch, TransferJob, TrustedDevice};
+use crate::models::{AppStateSnapshot, ClipboardHistoryEntry, SettingsPatch, TransferJob, TrustedDevice};
 use crate::runtime::RelayRuntime;
 use tauri::{Manager, State, WindowEvent};
 
@@ -64,6 +64,13 @@ fn list_transfer_jobs(runtime: State<'_, RelayRuntime>) -> Result<Vec<TransferJo
 }
 
 #[tauri::command]
+fn list_clipboard_history(
+    runtime: State<'_, RelayRuntime>,
+) -> Result<Vec<ClipboardHistoryEntry>, String> {
+    Ok(runtime.list_clipboard_history())
+}
+
+#[tauri::command]
 fn place_received_transfer_on_clipboard(
     runtime: State<'_, RelayRuntime>,
     transfer_id: String,
@@ -87,6 +94,21 @@ fn cancel_transfer_job(
     transfer_id: String,
 ) -> Result<(), String> {
     runtime.cancel_transfer_job(transfer_id).map_err(to_error_string)
+}
+
+#[tauri::command]
+fn restore_clipboard_history_entry(
+    runtime: State<'_, RelayRuntime>,
+    entry_id: String,
+) -> Result<(), String> {
+    runtime
+        .restore_clipboard_history_entry(entry_id)
+        .map_err(to_error_string)
+}
+
+#[tauri::command]
+fn open_cache_directory(runtime: State<'_, RelayRuntime>) -> Result<(), String> {
+    runtime.open_cache_directory().map_err(to_error_string)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -123,9 +145,12 @@ pub fn run() {
             toggle_sync,
             update_settings,
             list_transfer_jobs,
+            list_clipboard_history,
             place_received_transfer_on_clipboard,
             dismiss_transfer_job,
-            cancel_transfer_job
+            cancel_transfer_job,
+            restore_clipboard_history_entry,
+            open_cache_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

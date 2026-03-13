@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 pub const PROTOCOL_VERSION: &str = "relayclip/v1";
 pub const CAPABILITIES: [&str; 3] = ["text_utf8", "image_png", "file_refs"];
 pub const TRANSFER_RETENTION_HOURS: i64 = 24;
+pub const CLIPBOARD_HISTORY_RETENTION_HOURS: i64 = 72;
+pub const CLIPBOARD_HISTORY_LIMIT: usize = 60;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppLanguage {
@@ -177,6 +179,40 @@ pub struct PersistentState {
     pub settings: AppSettings,
     pub certificate_der_b64: String,
     pub private_key_der_b64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClipboardHistoryKind {
+    Text,
+    Image,
+    FileRefs,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClipboardHistorySource {
+    Local,
+    Remote,
+    Transfer,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardHistoryEntry {
+    pub entry_id: String,
+    pub kind: ClipboardHistoryKind,
+    pub source: ClipboardHistorySource,
+    pub display_name: String,
+    pub preview_text: Option<String>,
+    pub mime: Option<String>,
+    pub hash: String,
+    pub size: u64,
+    pub file_count: Option<u32>,
+    pub created_at: DateTime<Utc>,
+    pub payload_path: Option<String>,
+    pub transfer_id: Option<String>,
+    pub top_level_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

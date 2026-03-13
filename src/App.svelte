@@ -5,20 +5,24 @@
     dismissTransferJob,
     getAppState,
     isAutostartEnabled,
+    listClipboardHistory,
     listTransferJobs,
+    onClipboardHistoryUpdated,
     onClipboardError,
     onDevicesUpdated,
     onSyncStatusChanged,
     onTransferJobsUpdated,
+    openCacheDirectory,
     onTransferReady,
     placeReceivedTransferOnClipboard,
+    restoreClipboardHistoryEntry,
     setActiveDevice,
     syncAutostart,
     toggleSync,
     updateSettings,
   } from './lib/api'
   import { getMessages, normalizeLanguage } from './lib/i18n'
-  import type { AppStateSnapshot, TransferJob } from './lib/types'
+  import type { AppStateSnapshot, ClipboardHistoryEntry, TransferJob } from './lib/types'
   import {
     isPermissionGranted,
     requestPermission,
@@ -27,7 +31,9 @@
 
   let snapshot: AppStateSnapshot | null = null
   let transferJobs: TransferJob[] = []
+  let clipboardHistory: ClipboardHistoryEntry[] = []
   let busyTransferId: string | null = null
+  let busyHistoryId: string | null = null
   let settingsBusy = false
   let errorBanner: string | null = null
   const notifiedReady = new Set<string>()
@@ -48,9 +54,14 @@
   $: syncStatus = snapshot?.syncStatus
 
   async function refresh() {
-    const [state, jobs] = await Promise.all([getAppState(), listTransferJobs()])
+    const [state, jobs, history] = await Promise.all([
+      getAppState(),
+      listTransferJobs(),
+      listClipboardHistory(),
+    ])
     snapshot = state
     transferJobs = jobs
+    clipboardHistory = history
 
     try {
       let shouldPersistAutostart = state.settings.launchOnLogin !== true
@@ -135,6 +146,27 @@
     }
   }
 
+  async function restoreHistory(entry: ClipboardHistoryEntry) {
+    busyHistoryId = entry.entryId
+    errorBanner = null
+    try {
+      await restoreClipboardHistoryEntry(entry.entryId)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyHistoryId = null
+    }
+  }
+
+  async function openCache() {
+    errorBanner = null
+    try {
+      await openCacheDirectory()
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    }
+  }
+
   async function notifyTransferReady(job: TransferJob) {
     if (notifiedReady.has(job.transferId)) return
     notifiedReady.add(job.transferId)
@@ -175,6 +207,15 @@
     return job.stage === 'ready' ? 100 : 0
   }
 
+  function formatTime(value: string) {
+    return new Intl.DateTimeFormat(currentLanguage === 'zh-CN' ? 'zh-CN' : 'en-US', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(value))
+  }
+
   onMount(() => {
     let disposed = false
     void refresh()
@@ -190,6 +231,9 @@
       }),
       onClipboardError((message) => {
         if (!disposed) errorBanner = message
+      }),
+      onClipboardHistoryUpdated((entries) => {
+        if (!disposed) clipboardHistory = entries
       }),
       onTransferJobsUpdated((jobs) => {
         if (!disposed) transferJobs = jobs
@@ -347,6 +391,51 @@
                     </button>
                   </div>
                 {/if}
+              </article>
+            {/each}
+          {/if}
+        </div>
+      </section>
+
+      <section class="card glass inner">
+        <div class="section-head with-action">
+          <span>{copy.clipboardHistory}</span>
+          <button class="ghost compact" on:click={openCache} type="button">
+            {copy.openCacheDirectory}
+          </button>
+        </div>
+        <div class="history-list">
+          {#if clipboardHistory.length === 0}
+            <article class="empty-card compact">
+              <strong>{copy.noClipboardHistory}</strong>
+            </article>
+          {:else}
+            {#each clipboardHistory as entry}
+              <article class="history-row">
+                <div class="history-main">
+                  <div>
+                    <strong>{entry.displayName}</strong>
+                    <small>
+                      {copy.historyKind(entry.kind, entry.fileCount)} · {copy.historySource(entry.source)}
+                    </small>
+                  </div>
+                  <small>{formatTime(entry.createdAt)}</small>
+                </div>
+                {#if entry.previewText}
+                  <p class="history-preview">{entry.previewText}</p>
+                {:else if entry.topLevelNames.length > 0}
+                  <p class="history-preview">{entry.topLevelNames.join(', ')}</p>
+                {/if}
+                <div class="action-row">
+                  <button
+                    class="ghost compact"
+                    disabled={busyHistoryId === entry.entryId}
+                    on:click={() => restoreHistory(entry)}
+                    type="button"
+                  >
+                    {copy.restoreHistory}
+                  </button>
+                </div>
               </article>
             {/each}
           {/if}

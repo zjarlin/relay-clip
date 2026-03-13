@@ -1,5 +1,6 @@
 use crate::models::{
-    current_platform, default_app_language, AppSettings, LocalDevice, PersistentState,
+    current_platform, default_app_language, AppSettings, ClipboardHistoryEntry,
+    CLIPBOARD_HISTORY_LIMIT, CLIPBOARD_HISTORY_RETENTION_HOURS, LocalDevice, PersistentState,
     TransferJob, TransferStage, TRANSFER_RETENTION_HOURS, CAPABILITIES, PROTOCOL_VERSION,
 };
 use crate::transport;
@@ -61,6 +62,28 @@ pub fn transfers_root_path(state_path: &Path) -> PathBuf {
         .join("inbox")
 }
 
+pub fn cache_root_path(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("cache")
+}
+
+pub fn clipboard_history_path(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("clipboard-history.json")
+}
+
+pub fn clipboard_history_root_path(state_path: &Path) -> PathBuf {
+    cache_root_path(state_path).join("clipboard-history")
+}
+
+pub fn clipboard_history_entry_dir(state_path: &Path, entry_id: &str) -> PathBuf {
+    clipboard_history_root_path(state_path).join(entry_id)
+}
+
 pub fn load_transfer_jobs(state_path: &Path) -> Result<Vec<TransferJob>> {
     let transfer_path = transfer_state_path(state_path);
     if !transfer_path.exists() {
@@ -86,6 +109,34 @@ pub fn save_transfer_jobs(state_path: &Path, jobs: &[TransferJob]) -> Result<()>
     let body = serde_json::to_string_pretty(jobs)?;
     fs::write(&transfer_path, body)
         .with_context(|| format!("failed to write {}", transfer_path.display()))?;
+    Ok(())
+}
+
+pub fn load_clipboard_history(state_path: &Path) -> Result<Vec<ClipboardHistoryEntry>> {
+    let history_path = clipboard_history_path(state_path);
+    if !history_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&history_path)
+        .with_context(|| format!("failed to read {}", history_path.display()))?;
+    let mut entries: Vec<ClipboardHistoryEntry> = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", history_path.display()))?;
+    normalize_clipboard_history(&mut entries, state_path)?;
+    save_clipboard_history(state_path, &entries)?;
+    Ok(entries)
+}
+
+pub fn save_clipboard_history(state_path: &Path, entries: &[ClipboardHistoryEntry]) -> Result<()> {
+    let history_path = clipboard_history_path(state_path);
+    if let Some(parent) = history_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let body = serde_json::to_string_pretty(entries)?;
+    fs::write(&history_path, body)
+        .with_context(|| format!("failed to write {}", history_path.display()))?;
     Ok(())
 }
 
@@ -210,6 +261,57 @@ fn normalize_transfer_jobs(jobs: &mut Vec<TransferJob>, state_path: &Path) -> Re
     Ok(())
 }
 
+fn normalize_clipboard_history(
+    entries: &mut Vec<ClipboardHistoryEntry>,
+    state_path: &Path,
+) -> Result<()> {
+    let now = Utc::now();
+    let cutoff = now - Duration::hours(CLIPBOARD_HISTORY_RETENTION_HOURS);
+    let history_root = clipboard_history_root_path(state_path);
+
+    entries.retain(|entry| {
+        if entry.created_at < cutoff {
+            if let Some(payload_path) = entry.payload_path.as_deref() {
+                let payload_path = PathBuf::from(payload_path);
+                if payload_path.starts_with(&history_root) {
+                    let _ = fs::remove_dir_all(
+                        payload_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new(&history_root)),
+                    );
+                }
+            }
+            return false;
+        }
+
+        entry
+            .payload_path
+            .as_deref()
+            .is_none_or(|payload_path| Path::new(payload_path).exists())
+    });
+
+    if entries.len() > CLIPBOARD_HISTORY_LIMIT {
+        for entry in entries.iter().skip(CLIPBOARD_HISTORY_LIMIT) {
+            if let Some(payload_path) = entry.payload_path.as_deref() {
+                let payload_path = PathBuf::from(payload_path);
+                if payload_path.starts_with(&history_root) {
+                    let _ = fs::remove_dir_all(
+                        payload_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new(&history_root)),
+                    );
+                }
+            }
+        }
+        entries.truncate(CLIPBOARD_HISTORY_LIMIT);
+    }
+
+    fs::create_dir_all(&history_root)
+        .with_context(|| format!("failed to create {}", history_root.display()))?;
+    prune_clipboard_history_directories(state_path, entries)?;
+    Ok(())
+}
+
 fn prune_transfer_directories(state_path: &Path, jobs: &[TransferJob]) -> Result<()> {
     let root = transfers_root_path(state_path);
     fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
@@ -218,6 +320,32 @@ fn prune_transfer_directories(state_path: &Path, jobs: &[TransferJob]) -> Result
         .iter()
         .filter_map(|job| job.staging_path.as_deref())
         .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+    for entry in fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !retained.iter().any(|retained_path| retained_path == &path) {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn prune_clipboard_history_directories(
+    state_path: &Path,
+    entries: &[ClipboardHistoryEntry],
+) -> Result<()> {
+    let root = clipboard_history_root_path(state_path);
+    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
+
+    let retained = entries
+        .iter()
+        .filter_map(|entry| entry.payload_path.as_deref())
+        .map(PathBuf::from)
+        .filter(|path| path.starts_with(&root))
+        .filter_map(|path| path.parent().map(PathBuf::from))
         .collect::<Vec<_>>();
 
     for entry in fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))? {

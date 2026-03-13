@@ -195,7 +195,8 @@ button {
 }
 
 .device-list,
-.transfer-list {
+.transfer-list,
+.history-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -209,6 +210,33 @@ button {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.history-row {
+  position: relative;
+  z-index: 1;
+  border-radius: 20px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.34);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.history-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-preview {
+  margin: 0;
+  color: #35536d;
+  font-size: 0.92rem;
+  line-height: 1.35;
+  word-break: break-word;
 }
 
 .transfer-row.ready {
@@ -261,6 +289,10 @@ button {
   flex: none;
 }
 
+.ghost.compact {
+  padding: 8px 13px;
+}
+
 .primary {
   color: #fff;
   background: linear-gradient(135deg, #13466c, #3f7ea0);
@@ -282,6 +314,10 @@ button {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.with-action {
+  align-items: center;
 }
 
 .toggle-row input[type='checkbox'] {
@@ -332,5 +368,11 @@ button {
 
   .primary.compact {
     align-self: flex-end;
+  }
+
+  .history-main,
+  .with-action {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

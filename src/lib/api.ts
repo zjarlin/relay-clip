@@ -7,6 +7,7 @@ import {
 } from '@tauri-apps/plugin-autostart'
 import type {
   AppStateSnapshot,
+  ClipboardHistoryEntry,
   SettingsPatch,
   SyncStatus,
   TransferJob,
@@ -37,6 +38,10 @@ export function listTransferJobs() {
   return invoke<TransferJob[]>('list_transfer_jobs')
 }
 
+export function listClipboardHistory() {
+  return invoke<ClipboardHistoryEntry[]>('list_clipboard_history')
+}
+
 export function placeReceivedTransferOnClipboard(transferId: string) {
   return invoke<void>('place_received_transfer_on_clipboard', { transferId })
 }
@@ -47,6 +52,14 @@ export function dismissTransferJob(transferId: string) {
 
 export function cancelTransferJob(transferId: string) {
   return invoke<void>('cancel_transfer_job', { transferId })
+}
+
+export function restoreClipboardHistoryEntry(entryId: string) {
+  return invoke<void>('restore_clipboard_history_entry', { entryId })
+}
+
+export function openCacheDirectory() {
+  return invoke<void>('open_cache_directory')
 }
 
 export function onDevicesUpdated(handler: (devices: TrustedDevice[]) => void) {
@@ -63,6 +76,12 @@ export function onClipboardError(handler: (message: string) => void) {
 
 export function onTransferJobsUpdated(handler: (jobs: TransferJob[]) => void) {
   return listen<TransferJob[]>('transfer_jobs_updated', (event) => handler(event.payload))
+}
+
+export function onClipboardHistoryUpdated(handler: (entries: ClipboardHistoryEntry[]) => void) {
+  return listen<ClipboardHistoryEntry[]>('clipboard_history_updated', (event) =>
+    handler(event.payload),
+  )
 }
 
 export function onTransferReady(handler: (job: TransferJob) => void) {

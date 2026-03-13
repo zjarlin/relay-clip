@@ -1,0 +1,96 @@
+mod clipboard;
+mod discovery;
+mod i18n;
+mod models;
+mod runtime;
+mod store;
+mod transport;
+mod tray;
+
+use crate::models::{AppStateSnapshot, SettingsPatch, TrustedDevice};
+use crate::runtime::RelayRuntime;
+use tauri::{Manager, State, WindowEvent};
+
+fn to_error_string(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+#[tauri::command]
+fn get_app_state(runtime: State<'_, RelayRuntime>) -> Result<AppStateSnapshot, String> {
+    runtime.snapshot().map_err(to_error_string)
+}
+
+#[tauri::command]
+fn list_devices(runtime: State<'_, RelayRuntime>) -> Result<Vec<TrustedDevice>, String> {
+    Ok(runtime.list_devices())
+}
+
+#[tauri::command]
+fn set_active_device(
+    runtime: State<'_, RelayRuntime>,
+    device_id: String,
+) -> Result<AppStateSnapshot, String> {
+    let snapshot = runtime
+        .set_active_device(device_id)
+        .map_err(to_error_string)?;
+    let _ = tray::refresh(runtime.app_handle(), &runtime);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn toggle_sync(
+    runtime: State<'_, RelayRuntime>,
+    enabled: bool,
+) -> Result<AppStateSnapshot, String> {
+    let snapshot = runtime.toggle_sync(enabled).map_err(to_error_string)?;
+    let _ = tray::refresh(runtime.app_handle(), &runtime);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn update_settings(
+    runtime: State<'_, RelayRuntime>,
+    patch: SettingsPatch,
+) -> Result<AppStateSnapshot, String> {
+    let snapshot = runtime.update_settings(patch).map_err(to_error_string)?;
+    let _ = tray::refresh(runtime.app_handle(), &runtime);
+    Ok(snapshot)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
+        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            let relay = RelayRuntime::new(app.handle().clone())?;
+            relay.initialize()?;
+            app.manage(relay.clone());
+            tray::setup(app.handle(), relay)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_app_state,
+            list_devices,
+            set_active_device,
+            toggle_sync,
+            update_settings
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

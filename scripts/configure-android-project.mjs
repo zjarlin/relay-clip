@@ -13,6 +13,21 @@ const manifestPath = path.join(
   'AndroidManifest.xml',
 )
 const gradlePath = path.join(root, 'src-tauri', 'gen', 'android', 'app', 'build.gradle.kts')
+const buildTaskPath = path.join(
+  root,
+  'src-tauri',
+  'gen',
+  'android',
+  'buildSrc',
+  'src',
+  'main',
+  'java',
+  'com',
+  'relayclip',
+  'mobile',
+  'kotlin',
+  'BuildTask.kt',
+)
 
 const permissions = [
   'android.permission.INTERNET',
@@ -89,4 +104,17 @@ android {
   }
 
   fs.writeFileSync(gradlePath, gradle)
+}
+
+if (fs.existsSync(buildTaskPath)) {
+  let buildTask = fs.readFileSync(buildTaskPath, 'utf8')
+
+  if (!buildTask.includes('listOf("--dir", "..", "exec", "tauri", "android", "android-studio-script")')) {
+    buildTask = buildTask.replace(
+      'val args = listOf("tauri", "android", "android-studio-script");',
+      'val args = listOf("--dir", "..", "exec", "tauri", "android", "android-studio-script");',
+    )
+  }
+
+  fs.writeFileSync(buildTaskPath, buildTask)
 }

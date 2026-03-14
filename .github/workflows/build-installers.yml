@@ -169,7 +169,6 @@ jobs:
           name: relayclip-android-packages
           path: |
             src-tauri/gen/android/app/build/outputs/**/*.apk
-            src-tauri/gen/android/app/build/outputs/**/*.aab
           if-no-files-found: error
 
       - name: Publish Android internal testing release
@@ -347,6 +346,5 @@ jobs:
             release-assets/relayclip-windows-installer/*.exe
             release-assets/relayclip-macos-installer/*.dmg
             release-assets/relayclip-android-packages/**/*.apk
-            release-assets/relayclip-android-packages/**/*.aab
             release-assets/relayclip-ios-archive/**/*.ipa
             release-assets/relayclip-ios-project/**/*.zip

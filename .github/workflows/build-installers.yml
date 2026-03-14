@@ -190,15 +190,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate iOS secrets
+      - name: Detect iOS signing mode
         shell: bash
         run: |
-          for secret_name in APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_API_PRIVATE_KEY APPLE_DEVELOPMENT_TEAM; do
-            if [ -z "${!secret_name}" ]; then
-              echo "Missing required secret: $secret_name" >&2
-              exit 1
-            fi
-          done
+          if [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER" ] && [ -n "$APPLE_API_PRIVATE_KEY" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
+            echo "Using signed iOS archive mode"
+          else
+            echo "Apple signing secrets are missing; falling back to iOS project archive mode"
+          fi
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -232,15 +231,18 @@ jobs:
         run: pnpm version:calver
 
       - name: Configure App Store Connect key
+        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
         shell: bash
         run: |
           mkdir -p "$HOME/private_keys"
           printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$HOME/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
 
       - name: Initialize iOS project
+        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
         run: pnpm tauri ios init --ci --skip-targets-install
 
       - name: Build signed iOS archive
+        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
         env:
           APPLE_API_KEY: ${{ env.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ env.APPLE_API_ISSUER }}
@@ -248,6 +250,7 @@ jobs:
         run: pnpm tauri ios build --ci --export-method app-store-connect --build-number $RELAYCLIP_BUILD_NUMBER
 
       - name: Locate IPA
+        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
         id: ios_ipa
         shell: bash
         run: |
@@ -255,14 +258,35 @@ jobs:
           echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload iOS artifact
+        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: relayclip-ios-archive
           path: src-tauri/gen/apple/build/**/*.ipa
           if-no-files-found: error
 
+      - name: Initialize unsigned iOS project
+        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+        run: pnpm tauri ios init --ci --skip-targets-install
+
+      - name: Package iOS project archive
+        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+        shell: bash
+        run: |
+          rm -f relayclip-ios-project.zip
+          cd src-tauri/gen
+          zip -r ../../relayclip-ios-project.zip apple
+
+      - name: Upload iOS project artifact
+        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: relayclip-ios-project
+          path: relayclip-ios-project.zip
+          if-no-files-found: error
+
       - name: Upload to TestFlight
-        if: ${{ steps.ios_ipa.outputs.path != '' }}
+        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && steps.ios_ipa.outputs.path != '' }}
         shell: bash
         run: |
           xcrun altool --upload-app \
@@ -296,3 +320,4 @@ jobs:
             release-assets/relayclip-android-packages/**/*.apk
             release-assets/relayclip-android-packages/**/*.aab
             release-assets/relayclip-ios-archive/**/*.ipa
+            release-assets/relayclip-ios-project/**/*.zip

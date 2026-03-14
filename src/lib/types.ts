@@ -29,7 +29,7 @@ export interface AppSettings {
   launchOnLogin: boolean
   discoveryEnabled: boolean
   syncEnabled: boolean
-  activeDeviceId: string | null
+  activeDeviceIds: string[]
   language: AppLanguage
 }
 
@@ -53,6 +53,8 @@ export interface ClipboardHistoryEntry {
   entryId: string
   kind: ClipboardHistoryKind
   source: ClipboardHistorySource
+  originDeviceId: string
+  originDeviceName: string
   displayName: string
   previewText: string | null
   mime: string | null
@@ -130,6 +132,5 @@ export interface SettingsPatch {
   launchOnLogin?: boolean
   discoveryEnabled?: boolean
   syncEnabled?: boolean
-  activeDeviceId?: string | null
   language?: AppLanguage
 }

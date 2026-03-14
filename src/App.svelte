@@ -16,23 +16,21 @@
     openCacheDirectory,
     placeReceivedTransferOnClipboard,
     restoreClipboardHistoryEntry,
-    setActiveDevice,
+    setDevicePairing,
     syncAutostart,
     toggleSync,
     updateSettings,
   } from './lib/api'
   import { getMessages, normalizeLanguage } from './lib/i18n'
   import type { AppStateSnapshot, ClipboardHistoryEntry, TransferJob } from './lib/types'
-  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+  import {
+    isPermissionGranted,
+    requestPermission,
+    sendNotification,
+  } from '@tauri-apps/plugin-notification'
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
-  import {
-    Card,
-    CardContent,
-    CardDescription,
-    CardHeader,
-    CardTitle,
-  } from '$lib/components/ui/card'
+  import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card'
   import { Input } from '$lib/components/ui/input'
   import { Progress } from '$lib/components/ui/progress'
   import { ScrollArea } from '$lib/components/ui/scroll-area'
@@ -41,19 +39,29 @@
   import {
     ClipboardList,
     Copy,
+    Laptop2,
     FolderOpen,
     Image,
     Link2,
     Search,
     Send,
+    Smartphone,
     Type,
   } from '@lucide/svelte'
+
+  interface HistoryGroup {
+    deviceId: string
+    deviceName: string
+    isLocal: boolean
+    entries: ClipboardHistoryEntry[]
+  }
 
   let snapshot: AppStateSnapshot | null = null
   let transferJobs: TransferJob[] = []
   let clipboardHistory: ClipboardHistoryEntry[] = []
   let busyTransferId: string | null = null
   let busyHistoryId: string | null = null
+  let busyPairingId: string | null = null
   let settingsBusy = false
   let errorBanner: string | null = null
   const notifiedReady = new Set<string>()
@@ -63,15 +71,14 @@
     normalizeLanguage(typeof navigator === 'undefined' ? undefined : navigator.language)
   $: copy = getMessages(currentLanguage)
   $: devices = snapshot?.devices ?? []
-  $: activeDevice = devices.find((device) => device.isActive) ?? null
+  $: localDevice = snapshot?.localDevice ?? null
+  $: pairedDevices = devices.filter((device) => device.isActive)
   $: nearbyDevices = devices.filter(
-    (device) =>
-      !device.isActive &&
-      device.isOnline &&
-      device.deviceId !== (snapshot?.localDevice.deviceId ?? ''),
+    (device) => !device.isActive && device.isOnline && device.deviceId !== (localDevice?.deviceId ?? ''),
   )
   $: visibleTransferJobs = transferJobs
   $: syncStatus = snapshot?.syncStatus
+  $: historyGroups = groupHistory(clipboardHistory, localDevice?.deviceId ?? '', localDevice?.deviceName ?? copy.thisDevice)
 
   async function refresh() {
     const [state, jobs, history] = await Promise.all([
@@ -112,12 +119,15 @@
     }
   }
 
-  async function pairDevice(deviceId: string) {
+  async function updatePairing(deviceId: string, paired: boolean) {
+    busyPairingId = deviceId
     errorBanner = null
     try {
-      snapshot = await setActiveDevice(deviceId)
+      snapshot = await setDevicePairing(deviceId, paired)
     } catch (error) {
       errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyPairingId = null
     }
   }
 
@@ -203,6 +213,62 @@
         body: copy.notificationBody(job.displayName),
       })
     }
+  }
+
+  function groupHistory(entries: ClipboardHistoryEntry[], localDeviceId: string, localDeviceName: string): HistoryGroup[] {
+    const groups = new Map<string, HistoryGroup>()
+
+    for (const entry of entries) {
+      const isLocal = entry.originDeviceId === localDeviceId || entry.source === 'local'
+      const deviceId = entry.originDeviceId || (isLocal ? localDeviceId : `unknown:${entry.entryId}`)
+      const deviceName =
+        entry.originDeviceName || (isLocal ? localDeviceName : copy.unknownDevice)
+
+      if (!groups.has(deviceId)) {
+        groups.set(deviceId, {
+          deviceId,
+          deviceName,
+          isLocal,
+          entries: [],
+        })
+      }
+
+      groups.get(deviceId)?.entries.push(entry)
+    }
+
+    return Array.from(groups.values()).sort((left, right) => {
+      if (left.isLocal !== right.isLocal) {
+        return left.isLocal ? -1 : 1
+      }
+
+      const leftTime = left.entries[0]?.createdAt ?? ''
+      const rightTime = right.entries[0]?.createdAt ?? ''
+      return rightTime.localeCompare(leftTime)
+    })
+  }
+
+  function isMobilePlatform(platform: string) {
+    const normalized = platform.toLowerCase()
+    return (
+      normalized.includes('ios') ||
+      normalized.includes('iphone') ||
+      normalized.includes('ipad') ||
+      normalized.includes('android') ||
+      normalized.includes('mobile')
+    )
+  }
+
+  function platformLabel(platform: string) {
+    if (!platform) return copy.unknownDevice
+    return platform
+  }
+
+  function groupPlatform(group: HistoryGroup) {
+    if (group.isLocal) {
+      return localDevice?.platform ?? ''
+    }
+
+    return devices.find((device) => device.deviceId === group.deviceId)?.platform ?? ''
   }
 
   function formatBytes(value: number) {
@@ -302,7 +368,7 @@
                 value={snapshot.settings.deviceName}
               />
             </div>
-            <div class="flex max-w-36 flex-col items-end gap-1 text-right">
+            <div class="flex max-w-40 flex-col items-end gap-1 text-right">
               <Badge variant={statusVariant(syncStatus?.state)}>{copy.syncState(syncStatus?.state ?? 'idle')}</Badge>
               <p class="text-[11px] leading-4 text-muted-foreground">
                 {syncStatus?.message ?? ''}
@@ -318,35 +384,48 @@
 
         <CardContent class="space-y-3">
           <div class="space-y-2">
-            <div class="flex items-center justify-between">
+            <div class="flex items-center justify-between gap-3">
               <div>
-                <CardTitle>{copy.currentPair}</CardTitle>
+                <CardTitle>{copy.pairedDevices}</CardTitle>
                 <CardDescription class="mt-1">
-                  {activeDevice ? copy.activeNow : copy.noActivePairHint}
+                  {pairedDevices.length > 0 ? copy.pairedDevicesCount(pairedDevices.length) : copy.noPairedDevicesHint}
                 </CardDescription>
               </div>
-              {#if activeDevice}
-                <Badge variant="secondary">{copy.activeNow}</Badge>
-              {/if}
+              <Badge variant="secondary">{copy.pairedDevicesCount(pairedDevices.length)}</Badge>
             </div>
 
-            <div class="rounded-lg border bg-background px-3 py-2">
-              {#if activeDevice}
-                <div class="flex items-center justify-between gap-3">
-                  <div class="min-w-0">
-                    <div class="truncate font-medium">{activeDevice.name}</div>
-                    <div class="text-xs text-muted-foreground">
-                      {activeDevice.platform} · {activeDevice.isOnline ? copy.online : copy.offline}
+            {#if pairedDevices.length === 0}
+              <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
+                <div class="font-medium text-foreground">{copy.noPairedDevices}</div>
+                <div class="mt-1">{copy.noPairedDevicesHint}</div>
+              </div>
+            {:else}
+              <div class="space-y-2">
+                {#each pairedDevices as device}
+                  <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-2">
+                    <div class="flex min-w-0 items-center gap-2">
+                      {#if isMobilePlatform(device.platform)}
+                        <Smartphone class="size-3.5 text-muted-foreground" />
+                      {:else}
+                        <Laptop2 class="size-3.5 text-muted-foreground" />
+                      {/if}
+                      <div class="min-w-0">
+                        <div class="truncate font-medium">{device.name}</div>
+                        <div class="text-xs text-muted-foreground">{platformLabel(device.platform)} · {device.isOnline ? copy.online : copy.offline}</div>
+                      </div>
                     </div>
+                    <Button
+                      disabled={busyPairingId === device.deviceId}
+                      on:click={() => updatePairing(device.deviceId, false)}
+                      size="sm"
+                      variant="outline"
+                    >
+                      {copy.unpair}
+                    </Button>
                   </div>
-                  <Badge variant="outline">{activeDevice.isOnline ? copy.online : copy.offline}</Badge>
-                </div>
-              {:else}
-                <div class="text-xs text-muted-foreground">
-                  {copy.noActivePair}
-                </div>
-              {/if}
-            </div>
+                {/each}
+              </div>
+            {/if}
           </div>
 
           <Separator />
@@ -359,19 +438,31 @@
 
             {#if nearbyDevices.length === 0}
               <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
-                <div class="font-medium text-foreground">{copy.waitingDevices}</div>
-                <div class="mt-1">{copy.waitingDevicesHint}</div>
+                <div class="font-medium text-foreground">{copy.noNearbyDevices}</div>
+                <div class="mt-1">{copy.nearbyDevicesHint}</div>
               </div>
             {:else}
               <div class="space-y-2">
                 {#each nearbyDevices as device}
                   <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-2">
-                    <div class="min-w-0">
-                      <div class="truncate font-medium">{device.name}</div>
-                      <div class="text-xs text-muted-foreground">{device.platform}</div>
+                    <div class="flex min-w-0 items-center gap-2">
+                      {#if isMobilePlatform(device.platform)}
+                        <Smartphone class="size-3.5 text-muted-foreground" />
+                      {:else}
+                        <Laptop2 class="size-3.5 text-muted-foreground" />
+                      {/if}
+                      <div class="min-w-0">
+                        <div class="truncate font-medium">{device.name}</div>
+                        <div class="text-xs text-muted-foreground">{platformLabel(device.platform)}</div>
+                      </div>
                     </div>
-                    <Button on:click={() => pairDevice(device.deviceId)} size="sm" variant="secondary">
-                      {copy.makeActive}
+                    <Button
+                      disabled={busyPairingId === device.deviceId}
+                      on:click={() => updatePairing(device.deviceId, true)}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      {copy.pair}
                     </Button>
                   </div>
                 {/each}
@@ -398,7 +489,7 @@
           {:else}
             <ScrollArea class="max-h-64 space-y-2 pr-1">
               {#each visibleTransferJobs as job}
-                <div class="space-y-2 rounded-lg border bg-background px-3 py-3">
+                <div class="mb-2 space-y-2 rounded-lg border bg-background px-3 py-3">
                   <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0">
                       <div class="truncate font-medium">{job.displayName}</div>
@@ -471,7 +562,7 @@
           <div class="flex items-center justify-between gap-3">
             <div class="flex items-center gap-2">
               <ClipboardList class="size-4 text-muted-foreground" />
-              <CardTitle>{copy.clipboardHistory}</CardTitle>
+              <CardTitle>{copy.copyCenter}</CardTitle>
             </div>
             <Button on:click={openCache} size="sm" variant="ghost">
               <FolderOpen class="size-4" />
@@ -480,52 +571,75 @@
           </div>
         </CardHeader>
         <CardContent class="pt-0">
-          {#if clipboardHistory.length === 0}
+          {#if historyGroups.length === 0}
             <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
               {copy.noClipboardHistory}
             </div>
           {:else}
-            <ScrollArea class="max-h-72 space-y-2 pr-1">
-              {#each clipboardHistory as entry}
-                <div class="space-y-2 rounded-lg border bg-background px-3 py-3">
-                  <div class="flex items-start justify-between gap-3">
-                    <div class="flex min-w-0 items-start gap-2">
-                      <div class="mt-0.5 text-muted-foreground">
-                        {#if entry.kind === 'text'}
-                          <Type class="size-4" />
-                        {:else if entry.kind === 'image'}
-                          <Image class="size-4" />
+            <ScrollArea class="max-h-[30rem] pr-1">
+              <div class="space-y-3">
+                {#each historyGroups as group}
+                  <div class="rounded-lg border bg-background">
+                    <div class="flex items-center justify-between gap-3 border-b px-3 py-2">
+                      <div class="flex min-w-0 items-center gap-2">
+                        {#if isMobilePlatform(groupPlatform(group))}
+                          <Smartphone class="size-3.5 text-muted-foreground" />
                         {:else}
-                          <ClipboardList class="size-4" />
+                          <Laptop2 class="size-3.5 text-muted-foreground" />
+                        {/if}
+                        <div class="truncate font-medium">{group.deviceName}</div>
+                        {#if group.isLocal}
+                          <Badge variant="secondary">{copy.thisDevice}</Badge>
                         {/if}
                       </div>
-                      <div class="min-w-0">
-                        <div class="truncate font-medium">{entry.displayName}</div>
-                        <div class="text-xs text-muted-foreground">
-                          {copy.historyKind(entry.kind, entry.fileCount)} · {copy.historySource(entry.source)}
-                        </div>
-                      </div>
+                      <div class="text-[11px] text-muted-foreground">{copy.clips(group.entries.length)}</div>
                     </div>
-                    <div class="shrink-0 text-[11px] text-muted-foreground">{formatTime(entry.createdAt)}</div>
-                  </div>
 
-                  <p class="line-clamp-2 text-xs leading-5 text-muted-foreground">
-                    {historyPreview(entry)}
-                  </p>
+                    <div class="space-y-2 p-2">
+                      {#each group.entries as entry}
+                        <div class="rounded-md border px-3 py-2">
+                          <div class="flex items-start justify-between gap-3">
+                            <div class="flex min-w-0 items-start gap-2">
+                              <div class="mt-0.5 text-muted-foreground">
+                                {#if entry.kind === 'text'}
+                                  <Type class="size-4" />
+                                {:else if entry.kind === 'image'}
+                                  <Image class="size-4" />
+                                {:else}
+                                  <ClipboardList class="size-4" />
+                                {/if}
+                              </div>
+                              <div class="min-w-0">
+                                <div class="truncate font-medium">{entry.displayName}</div>
+                                <div class="text-xs text-muted-foreground">
+                                  {copy.historyKind(entry.kind, entry.fileCount)} · {copy.historySource(entry.source)}
+                                </div>
+                              </div>
+                            </div>
+                            <div class="shrink-0 text-[11px] text-muted-foreground">{formatTime(entry.createdAt)}</div>
+                          </div>
 
-                  <div class="flex justify-end">
-                    <Button
-                      disabled={busyHistoryId === entry.entryId}
-                      on:click={() => restoreHistory(entry)}
-                      size="sm"
-                      variant="outline"
-                    >
-                      <Copy class="size-3.5" />
-                      {copy.restoreHistory}
-                    </Button>
+                          <p class="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">
+                            {historyPreview(entry)}
+                          </p>
+
+                          <div class="mt-2 flex justify-end">
+                            <Button
+                              disabled={busyHistoryId === entry.entryId}
+                              on:click={() => restoreHistory(entry)}
+                              size="sm"
+                              variant="outline"
+                            >
+                              <Copy class="size-3.5" />
+                              {copy.restoreHistory}
+                            </Button>
+                          </div>
+                        </div>
+                      {/each}
+                    </div>
                   </div>
-                </div>
-              {/each}
+                {/each}
+              </div>
             </ScrollArea>
           {/if}
         </CardContent>

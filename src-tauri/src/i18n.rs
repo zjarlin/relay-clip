@@ -23,21 +23,22 @@ pub fn paused(language: AppLanguage) -> String {
     }
 }
 
-pub fn no_active_device(language: AppLanguage) -> String {
+pub fn no_paired_devices(language: AppLanguage) -> String {
     match language {
-        AppLanguage::ZhCn => "当前还没有选中的接力设备".to_string(),
-        AppLanguage::En => "No active device is selected yet".to_string(),
+        AppLanguage::ZhCn => "当前还没有已配对设备".to_string(),
+        AppLanguage::En => "No paired devices selected yet".to_string(),
     }
 }
 
-pub fn sending(language: AppLanguage, kind: &ClipboardPayloadKind, device_name: &str) -> String {
+pub fn sending(language: AppLanguage, kind: &ClipboardPayloadKind, device_count: usize) -> String {
     match language {
         AppLanguage::ZhCn => {
-            format!("正在将{}剪贴板发送到 {}", payload_kind(language, kind), device_name)
+            format!("正在向 {device_count} 台设备发送{}", payload_kind(language, kind))
         }
-        AppLanguage::En => {
-            format!("Sending {} clipboard to {}", payload_kind(language, kind), device_name)
-        }
+        AppLanguage::En => format!(
+            "Sending {} clipboard to {device_count} paired device(s)",
+            payload_kind(language, kind)
+        ),
     }
 }
 
@@ -69,10 +70,17 @@ pub fn discovery_disabled(language: AppLanguage) -> String {
     }
 }
 
-pub fn active_device_ready(language: AppLanguage) -> String {
+pub fn paired_devices_ready(language: AppLanguage, count: usize) -> String {
     match language {
-        AppLanguage::ZhCn => "当前配对设备在线，可直接接力".to_string(),
-        AppLanguage::En => "Active device is online and ready".to_string(),
+        AppLanguage::ZhCn => format!("已有 {count} 台已配对设备在线，可直接接力"),
+        AppLanguage::En => format!("{count} paired device(s) online and ready"),
+    }
+}
+
+pub fn paired_devices_offline(language: AppLanguage) -> String {
+    match language {
+        AppLanguage::ZhCn => "已配对设备当前离线".to_string(),
+        AppLanguage::En => "Paired devices are currently offline".to_string(),
     }
 }
 
@@ -106,22 +114,29 @@ pub fn route_lookup_failed(language: AppLanguage, error: &str) -> String {
 
 pub fn active_label(language: AppLanguage, active_name: &str) -> String {
     match language {
-        AppLanguage::ZhCn => format!("当前设备：{active_name}"),
-        AppLanguage::En => format!("Active: {active_name}"),
+        AppLanguage::ZhCn => format!("已配对：{active_name}"),
+        AppLanguage::En => format!("Paired: {active_name}"),
     }
 }
 
 pub fn no_active_device_label(language: AppLanguage) -> &'static str {
     match language {
-        AppLanguage::ZhCn => "暂无活动设备",
-        AppLanguage::En => "No active device",
+        AppLanguage::ZhCn => "暂无已配对设备",
+        AppLanguage::En => "No paired devices",
     }
 }
 
-pub fn tray_devices(language: AppLanguage) -> &'static str {
+pub fn tray_paired_devices(language: AppLanguage) -> &'static str {
     match language {
-        AppLanguage::ZhCn => "设备列表",
-        AppLanguage::En => "Devices",
+        AppLanguage::ZhCn => "已配对设备",
+        AppLanguage::En => "Paired Devices",
+    }
+}
+
+pub fn tray_nearby_devices(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::ZhCn => "附近设备",
+        AppLanguage::En => "Nearby Devices",
     }
 }
 

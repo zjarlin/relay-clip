@@ -45,7 +45,8 @@ pub struct AppSettings {
     pub launch_on_login: bool,
     pub discovery_enabled: bool,
     pub sync_enabled: bool,
-    pub active_device_id: Option<String>,
+    #[serde(default)]
+    pub active_device_ids: Vec<String>,
     #[serde(default = "default_app_language")]
     pub language: AppLanguage,
 }
@@ -152,7 +153,6 @@ pub struct SettingsPatch {
     pub launch_on_login: Option<bool>,
     pub discovery_enabled: Option<bool>,
     pub sync_enabled: Option<bool>,
-    pub active_device_id: Option<Option<String>>,
     pub language: Option<AppLanguage>,
 }
 
@@ -203,6 +203,10 @@ pub struct ClipboardHistoryEntry {
     pub entry_id: String,
     pub kind: ClipboardHistoryKind,
     pub source: ClipboardHistorySource,
+    #[serde(default)]
+    pub origin_device_id: String,
+    #[serde(default)]
+    pub origin_device_name: String,
     pub display_name: String,
     pub preview_text: Option<String>,
     pub mime: Option<String>,

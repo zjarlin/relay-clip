@@ -179,7 +179,7 @@ fn default_state() -> Result<PersistentState> {
             launch_on_login: true,
             discovery_enabled: true,
             sync_enabled: true,
-            active_device_id: None,
+            active_device_ids: Vec::new(),
             language: default_app_language(),
         },
         certificate_der_b64: STANDARD.encode(cert_der),
@@ -201,7 +201,7 @@ fn normalize_state(state: &mut PersistentState) -> Result<()> {
     }
 
     state.settings.launch_on_login = true;
-    state.settings.active_device_id = None;
+    state.settings.active_device_ids.clear();
     state.trusted_devices.clear();
 
     state.local_device.device_name = state.settings.device_name.clone();

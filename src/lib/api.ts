@@ -22,8 +22,8 @@ export function listDevices() {
   return invoke<TrustedDevice[]>('list_devices')
 }
 
-export function setActiveDevice(deviceId: string) {
-  return invoke<AppStateSnapshot>('set_active_device', { deviceId })
+export function setDevicePairing(deviceId: string, paired: boolean) {
+  return invoke<AppStateSnapshot>('set_device_pairing', { deviceId, paired })
 }
 
 export function toggleSync(enabled: boolean) {

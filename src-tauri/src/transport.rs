@@ -23,6 +23,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 const MAX_FRAME_SIZE: usize = 12 * 1024 * 1024;
 const CHANNEL_CLIPBOARD: u8 = 1;
 const CHANNEL_TRANSFER: u8 = 2;
+const CHANNEL_CONTROL: u8 = 3;
 
 const TRANSFER_FRAME_OFFER: u8 = 1;
 const TRANSFER_FRAME_ACCEPT: u8 = 2;
@@ -32,6 +33,10 @@ const TRANSFER_FRAME_FILE_CHUNK: u8 = 5;
 const TRANSFER_FRAME_COMPLETE: u8 = 6;
 const TRANSFER_FRAME_CANCEL: u8 = 7;
 const TRANSFER_FRAME_ACK: u8 = 8;
+
+const CONTROL_FRAME_SET_DEVICE_PAIRING: u8 = 1;
+const CONTROL_FRAME_ACK: u8 = 2;
+const CONTROL_FRAME_REJECT: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
@@ -87,6 +92,14 @@ struct TransferDecision {
 struct FileStartFrame {
     relative_path: String,
     size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePairingUpdate {
+    pub origin_device_id: String,
+    pub target_device_id: String,
+    pub paired: bool,
 }
 
 pub async fn start_server(
@@ -241,6 +254,46 @@ pub async fn send_transfer(
     }
 }
 
+pub async fn send_device_pairing_update(
+    address: std::net::SocketAddr,
+    expected_fingerprint: &str,
+    update: DevicePairingUpdate,
+) -> Result<()> {
+    let connector = TlsConnector::from(Arc::new(build_client_config()));
+    let stream = TcpStream::connect(address)
+        .await
+        .with_context(|| format!("failed to connect to {address}"))?;
+    let server_name =
+        ServerName::try_from("relayclip.local").map_err(|_| anyhow!("invalid tls server name"))?;
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .context("failed to complete the tls handshake")?;
+
+    let fingerprint = peer_fingerprint(&tls_stream)?;
+    if fingerprint != expected_fingerprint {
+        bail!("peer fingerprint mismatch");
+    }
+
+    write_channel(&mut tls_stream, CHANNEL_CONTROL).await?;
+    write_control_json(&mut tls_stream, CONTROL_FRAME_SET_DEVICE_PAIRING, &update).await?;
+
+    let (frame_type, payload) = read_control_frame(&mut tls_stream).await?;
+    match frame_type {
+        CONTROL_FRAME_ACK => Ok(()),
+        CONTROL_FRAME_REJECT => {
+            let decision: TransferDecision = serde_json::from_slice(&payload)?;
+            bail!(
+                "{}",
+                decision
+                    .reason
+                    .unwrap_or_else(|| "peer rejected active device sync".to_string())
+            )
+        }
+        _ => bail!("unexpected control response frame"),
+    }
+}
+
 pub fn fingerprint_from_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -304,9 +357,54 @@ async fn accept_connection(
             }
         },
         CHANNEL_TRANSFER => accept_transfer(runtime, &mut tls_stream).await?,
+        CHANNEL_CONTROL => accept_control(runtime, &mut tls_stream).await?,
         _ => bail!("unsupported relay channel"),
     }
     Ok(())
+}
+
+async fn accept_control(
+    runtime: RelayRuntime,
+    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+) -> Result<()> {
+    let (frame_type, payload) = read_control_frame(stream).await?;
+    match frame_type {
+        CONTROL_FRAME_SET_DEVICE_PAIRING => {
+            let update: DevicePairingUpdate = serde_json::from_slice(&payload)?;
+            match runtime.accept_remote_device_pairing_update(
+                &update.origin_device_id,
+                &update.target_device_id,
+                update.paired,
+            ) {
+                Ok(_) => {
+                    write_control_json(
+                        stream,
+                        CONTROL_FRAME_ACK,
+                        &TransferDecision {
+                            accepted: true,
+                            reason: None,
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    write_control_json(
+                        stream,
+                        CONTROL_FRAME_REJECT,
+                        &TransferDecision {
+                            accepted: false,
+                            reason: Some(error.to_string()),
+                        },
+                    )
+                    .await
+                    .ok();
+                    Err(error)
+                }
+            }
+        }
+        _ => bail!("unexpected control frame"),
+    }
 }
 
 async fn accept_transfer(
@@ -550,6 +648,15 @@ where
     write_transfer_bytes(stream, frame_type, &payload).await
 }
 
+async fn write_control_json<S, T>(stream: &mut S, frame_type: u8, value: &T) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value)?;
+    write_control_bytes(stream, frame_type, &payload).await
+}
+
 async fn write_transfer_bytes<S>(stream: &mut S, frame_type: u8, payload: &[u8]) -> Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -568,6 +675,34 @@ where
 }
 
 async fn read_transfer_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
+where
+    S: AsyncRead + Unpin,
+{
+    let frame_type = stream.read_u8().await?;
+    let payload_len = stream.read_u32().await? as usize;
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+    Ok((frame_type, payload))
+}
+
+async fn write_control_bytes<S>(stream: &mut S, frame_type: u8, payload: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if payload.len() > u32::MAX as usize {
+        bail!("control frame exceeded the maximum supported size");
+    }
+
+    stream.write_u8(frame_type).await?;
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_control_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
 where
     S: AsyncRead + Unpin,
 {

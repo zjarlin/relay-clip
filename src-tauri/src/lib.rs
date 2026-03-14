@@ -16,6 +16,12 @@ fn to_error_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+#[cfg(target_os = "macos")]
+fn configure_macos_status_bar_app(app: &tauri::AppHandle) -> tauri::Result<()> {
+    app.set_dock_visibility(false)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn get_app_state(runtime: State<'_, RelayRuntime>) -> Result<AppStateSnapshot, String> {
     runtime.snapshot().map_err(to_error_string)
@@ -27,12 +33,13 @@ fn list_devices(runtime: State<'_, RelayRuntime>) -> Result<Vec<TrustedDevice>, 
 }
 
 #[tauri::command]
-fn set_active_device(
+fn set_device_pairing(
     runtime: State<'_, RelayRuntime>,
     device_id: String,
+    paired: bool,
 ) -> Result<AppStateSnapshot, String> {
     let snapshot = runtime
-        .set_active_device(device_id)
+        .set_device_pairing(device_id, paired)
         .map_err(to_error_string)?;
     let _ = tray::refresh(runtime.app_handle(), &runtime);
     Ok(snapshot)
@@ -124,6 +131,9 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            configure_macos_status_bar_app(app.handle())?;
+
             let relay = RelayRuntime::new(app.handle().clone())?;
             relay.initialize()?;
             app.manage(relay.clone());
@@ -141,7 +151,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             list_devices,
-            set_active_device,
+            set_device_pairing,
             toggle_sync,
             update_settings,
             list_transfer_jobs,

@@ -11,18 +11,21 @@ import type {
 export interface Messages {
   title: string
   nearby: string
-  currentPair: string
-  waitingDevices: string
-  waitingDevicesHint: string
-  noActivePair: string
-  noActivePairHint: string
-  makeActive: string
+  pairedDevices: string
+  pairedDevicesCount(count: number): string
+  noPairedDevices: string
+  noPairedDevicesHint: string
+  noNearbyDevices: string
+  nearbyDevicesHint: string
+  pair: string
+  paired: string
+  unpair: string
   activeNow: string
   online: string
   offline: string
   transfers: string
   noTransfers: string
-  clipboardHistory: string
+  copyCenter: string
   noClipboardHistory: string
   restoreHistory: string
   openCacheDirectory: string
@@ -32,6 +35,9 @@ export interface Messages {
   cancel: string
   syncEnabled: string
   saving: string
+  unknownDevice: string
+  thisDevice: string
+  clips(count: number): string
   syncState(state: SyncState): string
   transferState(stage: TransferStage, direction: TransferDirection): string
   transferSummary(done: number, total: number): string
@@ -46,18 +52,21 @@ export interface Messages {
 const english: Messages = {
   title: 'RelayClip',
   nearby: 'Nearby devices',
-  currentPair: 'Current pairing',
-  waitingDevices: 'No other online devices found',
-  waitingDevicesHint: 'Devices on the same LAN will appear here automatically.',
-  noActivePair: 'No device paired yet',
-  noActivePairHint: 'Choose one online device below when it appears.',
-  makeActive: 'Pair',
+  pairedDevices: 'Paired devices',
+  pairedDevicesCount: (count) => `${count} paired`,
+  noPairedDevices: 'No paired devices yet',
+  noPairedDevicesHint: 'Copies will fan out to every paired device.',
+  noNearbyDevices: 'No other online devices found',
+  nearbyDevicesHint: 'Devices on the same LAN appear here automatically.',
+  pair: 'Pair',
+  paired: 'Paired',
+  unpair: 'Unpair',
   activeNow: 'Connected',
   online: 'Online',
   offline: 'Offline',
   transfers: 'Transfers',
   noTransfers: 'No file relays yet.',
-  clipboardHistory: 'Clipboard history',
+  copyCenter: 'Copy center',
   noClipboardHistory: 'No clipboard history yet.',
   restoreHistory: 'Copy',
   openCacheDirectory: 'Open cache',
@@ -67,6 +76,9 @@ const english: Messages = {
   cancel: 'Cancel',
   syncEnabled: 'Clipboard sync',
   saving: 'Saving...',
+  unknownDevice: 'Unknown device',
+  thisDevice: 'This device',
+  clips: (count) => `${count} clip${count === 1 ? '' : 's'}`,
   syncState: (state) =>
     ({
       idle: 'Idle',
@@ -119,27 +131,33 @@ const english: Messages = {
 const chinese: Messages = {
   title: 'RelayClip',
   nearby: '附近设备',
-  currentPair: '当前配对',
-  waitingDevices: '还没有发现其他在线设备',
-  waitingDevicesHint: '同一局域网内的设备会自动出现在这里。',
-  noActivePair: '还没有配对设备',
-  noActivePairHint: '下方出现在线设备后可直接配对。',
-  makeActive: '配对',
+  pairedDevices: '已配对设备',
+  pairedDevicesCount: (count) => `已配对 ${count} 台`,
+  noPairedDevices: '还没有已配对设备',
+  noPairedDevicesHint: '复制内容会同步到所有已配对设备。',
+  noNearbyDevices: '还没有发现其他在线设备',
+  nearbyDevicesHint: '同一局域网中的设备会自动出现在这里。',
+  pair: '配对',
+  paired: '已配对',
+  unpair: '取消配对',
   activeNow: '已连接',
   online: '在线',
   offline: '离线',
   transfers: '文件接力',
   noTransfers: '还没有文件接力任务。',
-  clipboardHistory: '剪贴板历史',
+  copyCenter: '复制中心',
   noClipboardHistory: '还没有剪贴板历史。',
   restoreHistory: '复制',
-  openCacheDirectory: '打开缓存目录',
+  openCacheDirectory: '打开缓存',
   readyToPaste: '已下载完成，可放入剪贴板',
   placeOnClipboard: '放入剪贴板',
   dismiss: '忽略',
   cancel: '取消',
   syncEnabled: '剪贴板同步',
   saving: '保存中...',
+  unknownDevice: '未知设备',
+  thisDevice: '本机',
+  clips: (count) => `${count} 条`,
   syncState: (state) =>
     ({
       idle: '空闲',
@@ -147,7 +165,7 @@ const chinese: Messages = {
       connected: '已连接',
       syncing: '同步中',
       paused: '已暂停',
-      error: '出错',
+      error: '错误',
     })[state],
   transferState: (stage, direction) => {
     if (stage === 'ready') {

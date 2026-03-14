@@ -215,6 +215,23 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
+      - name: Ensure iOS build dependencies
+        shell: bash
+        run: |
+          BREW_PACKAGES=()
+
+          command -v xcodegen >/dev/null 2>&1 || BREW_PACKAGES+=(xcodegen)
+          command -v pod >/dev/null 2>&1 || BREW_PACKAGES+=(cocoapods)
+          command -v idevicesyslog >/dev/null 2>&1 || BREW_PACKAGES+=(libimobiledevice)
+
+          if [ ${#BREW_PACKAGES[@]} -gt 0 ]; then
+            brew install "${BREW_PACKAGES[@]}"
+          fi
+
+          xcodegen --version
+          pod --version
+          command -v idevicesyslog
+
       - name: Restore Rust cache
         uses: swatinem/rust-cache@v2
         with:

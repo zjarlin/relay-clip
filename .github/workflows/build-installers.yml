@@ -284,7 +284,19 @@ jobs:
 
       - name: Initialize unsigned iOS project
         if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+        env:
+          APPLE_DEVELOPMENT_TEAM: TEAMID0000
         run: pnpm tauri ios init --ci --skip-targets-install
+
+      - name: Add unsigned iOS archive note
+        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+        shell: bash
+        run: |
+          cat > src-tauri/gen/apple/README-CODE-SIGNING.txt <<'EOF'
+          This archive contains an unsigned iOS Xcode project generated without Apple signing secrets.
+          Replace the placeholder development team ID TEAMID0000 with your real Apple Developer Team ID
+          before building or archiving the app in Xcode.
+          EOF
 
       - name: Package iOS project archive
         if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}

@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
     "version:calver": "node ./scripts/set-calver.mjs",
+    "android:prepare": "node ./scripts/prepare-android-build.mjs",
+    "android:debug:apk": "node ./scripts/build-android-debug.mjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "pnpm version:calver && tauri build",
     "tauri:android:init": "tauri android init --ci",

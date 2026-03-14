@@ -1,0 +1,13 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "identifier": "com.relayclip.mobile",
+  "bundle": {
+    "shortDescription": "Clipboard relay for iPhone and iPad on the same LAN.",
+    "iOS": {
+      "bundleVersion": "1",
+      "minimumSystemVersion": "15.0",
+      "infoPlist": "Info.ios.plist"
+    }
+  },
+  "version": "2026.3.13"
+}

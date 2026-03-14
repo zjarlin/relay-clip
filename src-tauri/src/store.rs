@@ -177,6 +177,7 @@ fn default_state() -> Result<PersistentState> {
         settings: AppSettings {
             device_name,
             launch_on_login: true,
+            background_sync_enabled: true,
             discovery_enabled: true,
             sync_enabled: true,
             active_device_ids: Vec::new(),

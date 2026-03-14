@@ -38,11 +38,204 @@ pub fn default_app_language() -> AppLanguage {
     AppLanguage::detect_system()
 }
 
+fn default_background_sync_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimePlatform {
+    Windows,
+    Macos,
+    Linux,
+    Android,
+    Ios,
+    #[default]
+    Unknown,
+}
+
+impl RuntimePlatform {
+    pub fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "android") {
+            Self::Android
+        } else if cfg!(target_os = "ios") {
+            Self::Ios
+        } else {
+            Self::Unknown
+        }
+    }
+
+    pub fn is_mobile(self) -> bool {
+        matches!(self, Self::Android | Self::Ios)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapabilities {
+    pub tray: bool,
+    pub autostart: bool,
+    pub clipboard_monitor: bool,
+    pub clipboard_files: bool,
+    pub open_cache_directory: bool,
+    pub share_externally: bool,
+    pub export_to_files: bool,
+    pub background_sync: bool,
+    pub native_discovery: bool,
+}
+
+impl RuntimeCapabilities {
+    pub fn for_platform(platform: RuntimePlatform) -> Self {
+        match platform {
+            RuntimePlatform::Windows | RuntimePlatform::Macos | RuntimePlatform::Linux => Self {
+                tray: true,
+                autostart: true,
+                clipboard_monitor: true,
+                clipboard_files: true,
+                open_cache_directory: true,
+                share_externally: false,
+                export_to_files: false,
+                background_sync: false,
+                native_discovery: true,
+            },
+            RuntimePlatform::Android | RuntimePlatform::Ios => Self {
+                tray: false,
+                autostart: false,
+                clipboard_monitor: false,
+                clipboard_files: false,
+                open_cache_directory: false,
+                share_externally: false,
+                export_to_files: false,
+                background_sync: true,
+                native_discovery: false,
+            },
+            RuntimePlatform::Unknown => Self::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimePermissionState {
+    Granted,
+    Denied,
+    Prompt,
+    #[default]
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePermissions {
+    pub notifications: RuntimePermissionState,
+    pub local_network: RuntimePermissionState,
+    pub clipboard: RuntimePermissionState,
+    pub background_sync: RuntimePermissionState,
+    pub file_access: RuntimePermissionState,
+}
+
+impl RuntimePermissions {
+    pub fn for_platform(platform: RuntimePlatform, capabilities: &RuntimeCapabilities) -> Self {
+        let mobile_prompt = if platform.is_mobile() {
+            RuntimePermissionState::Prompt
+        } else {
+            RuntimePermissionState::Granted
+        };
+
+        Self {
+            notifications: if capabilities.share_externally || capabilities.background_sync {
+                mobile_prompt
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            local_network: if capabilities.native_discovery || platform.is_mobile() {
+                mobile_prompt
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            clipboard: if capabilities.clipboard_monitor || capabilities.clipboard_files {
+                mobile_prompt
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            background_sync: if capabilities.background_sync {
+                mobile_prompt
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            file_access: if capabilities.export_to_files || capabilities.open_cache_directory {
+                mobile_prompt
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+        }
+    }
+
+    pub fn granted_for(capabilities: &RuntimeCapabilities) -> Self {
+        Self {
+            notifications: if capabilities.share_externally || capabilities.background_sync {
+                RuntimePermissionState::Granted
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            local_network: if capabilities.native_discovery || capabilities.background_sync {
+                RuntimePermissionState::Granted
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            clipboard: if capabilities.clipboard_monitor || capabilities.clipboard_files {
+                RuntimePermissionState::Granted
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            background_sync: if capabilities.background_sync {
+                RuntimePermissionState::Granted
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+            file_access: if capabilities.export_to_files || capabilities.open_cache_directory {
+                RuntimePermissionState::Granted
+            } else {
+                RuntimePermissionState::Unsupported
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundSyncMode {
+    Desktop,
+    ForegroundOnly,
+    ForegroundService,
+    AppRefresh,
+    #[default]
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundSyncState {
+    pub supported: bool,
+    pub enabled: bool,
+    pub active: bool,
+    pub mode: BackgroundSyncMode,
+    pub message: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub device_name: String,
     pub launch_on_login: bool,
+    #[serde(default = "default_background_sync_enabled")]
+    pub background_sync_enabled: bool,
     pub discovery_enabled: bool,
     pub sync_enabled: bool,
     #[serde(default)]
@@ -144,6 +337,9 @@ pub struct AppStateSnapshot {
     pub settings: AppSettings,
     pub devices: Vec<TrustedDevice>,
     pub sync_status: SyncStatus,
+    pub runtime_platform: RuntimePlatform,
+    pub capabilities: RuntimeCapabilities,
+    pub permissions: RuntimePermissions,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -151,6 +347,7 @@ pub struct AppStateSnapshot {
 pub struct SettingsPatch {
     pub device_name: Option<String>,
     pub launch_on_login: Option<bool>,
+    pub background_sync_enabled: Option<bool>,
     pub discovery_enabled: Option<bool>,
     pub sync_enabled: Option<bool>,
     pub language: Option<AppLanguage>,
@@ -260,6 +457,14 @@ pub enum ReadyActionState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub enum TransferAction {
+    PlaceOnClipboard,
+    ShareExternally,
+    ExportToFiles,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum TransferEntryKind {
     File,
     Directory,
@@ -296,6 +501,8 @@ pub struct TransferJob {
     pub staging_path: Option<String>,
     pub entries: Vec<TransferEntry>,
     pub top_level_names: Vec<String>,
+    #[serde(default)]
+    pub available_actions: Vec<TransferAction>,
 }
 
 pub fn current_platform() -> String {
@@ -303,6 +510,10 @@ pub fn current_platform() -> String {
         "Windows".to_string()
     } else if cfg!(target_os = "macos") {
         "macOS".to_string()
+    } else if cfg!(target_os = "ios") {
+        "iOS".to_string()
+    } else if cfg!(target_os = "android") {
+        "Android".to_string()
     } else {
         std::env::consts::OS.to_string()
     }

@@ -7,7 +7,10 @@ import {
 } from '@tauri-apps/plugin-autostart'
 import type {
   AppStateSnapshot,
+  BackgroundSyncState,
   ClipboardHistoryEntry,
+  RuntimeCapabilities,
+  RuntimePermissions,
   SettingsPatch,
   SyncStatus,
   TransferJob,
@@ -16,6 +19,18 @@ import type {
 
 export function getAppState() {
   return invoke<AppStateSnapshot>('get_app_state')
+}
+
+export function getRuntimeCapabilities() {
+  return invoke<RuntimeCapabilities>('get_runtime_capabilities')
+}
+
+export function requestRuntimePermissions() {
+  return invoke<RuntimePermissions>('request_runtime_permissions')
+}
+
+export function getBackgroundSyncState() {
+  return invoke<BackgroundSyncState>('get_background_sync_state')
 }
 
 export function listDevices() {
@@ -44,6 +59,14 @@ export function listClipboardHistory() {
 
 export function placeReceivedTransferOnClipboard(transferId: string) {
   return invoke<void>('place_received_transfer_on_clipboard', { transferId })
+}
+
+export function shareReceivedTransfer(transferId: string) {
+  return invoke<void>('share_received_transfer', { transferId })
+}
+
+export function exportReceivedTransfer(transferId: string) {
+  return invoke<void>('export_received_transfer', { transferId })
 }
 
 export function dismissTransferJob(transferId: string) {

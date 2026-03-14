@@ -1,4 +1,4 @@
-name: Build Installers
+name: Build Platforms
 
 on:
   workflow_dispatch:
@@ -11,8 +11,11 @@ on:
 permissions:
   contents: write
 
+env:
+  RELAYCLIP_BUILD_NUMBER: ${{ github.run_number }}
+
 jobs:
-  build:
+  build_desktop:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -63,24 +66,220 @@ jobs:
       - name: Apply calendar version
         run: pnpm version:calver
 
-      - name: Build installer
+      - name: Build desktop bundle
         run: pnpm tauri build --bundles ${{ matrix.bundle }}
 
-      - name: Upload installer artifact
+      - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}
           if-no-files-found: error
 
-  release:
-    name: Publish Release Assets
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+  build_android:
+    name: Android Packages
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download installer artifacts
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Restore Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck frontend
+        run: pnpm check
+
+      - name: Apply calendar version
+        run: pnpm version:calver
+
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci --skip-targets-install
+
+      - name: Patch Android project
+        run: node scripts/configure-android-project.mjs
+
+      - name: Configure Android signing
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+        shell: bash
+        run: |
+          mkdir -p src-tauri/gen/android
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > src-tauri/gen/android/relayclip-upload-keystore.jks
+          cat > src-tauri/gen/android/keystore.properties <<'EOF'
+          passwordFormatVersion=1
+          storeFile=relayclip-upload-keystore.jks
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - name: Build Android artifacts
+        run: pnpm tauri android build --ci --apk --aab --split-per-abi
+
+      - name: Locate Android bundle
+        id: android_bundle
+        shell: bash
+        run: |
+          AAB_PATH=$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' -print -quit)
+          echo "path=$AAB_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: relayclip-android-packages
+          path: |
+            src-tauri/gen/android/app/build/outputs/**/*.apk
+            src-tauri/gen/android/app/build/outputs/**/*.aab
+          if-no-files-found: error
+
+      - name: Publish Android internal testing release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && steps.android_bundle.outputs.path != '' && secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.relayclip.mobile
+          releaseFiles: ${{ steps.android_bundle.outputs.path }}
+          track: internal
+
+  build_ios:
+    name: iOS Archive
+    runs-on: macos-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate iOS secrets
+        shell: bash
+        run: |
+          for secret_name in APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_API_PRIVATE_KEY APPLE_DEVELOPMENT_TEAM; do
+            if [ -z "${!secret_name}" ]; then
+              echo "Missing required secret: $secret_name" >&2
+              exit 1
+            fi
+          done
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Restore Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck frontend
+        run: pnpm check
+
+      - name: Apply calendar version
+        run: pnpm version:calver
+
+      - name: Configure App Store Connect key
+        shell: bash
+        run: |
+          mkdir -p "$HOME/private_keys"
+          cat > "$HOME/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8" <<'EOF'
+          ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          EOF
+
+      - name: Initialize iOS project
+        run: pnpm tauri ios init --ci --skip-targets-install
+
+      - name: Build signed iOS archive
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        run: pnpm tauri ios build --ci --export-method app-store-connect --build-number $RELAYCLIP_BUILD_NUMBER
+
+      - name: Locate IPA
+        id: ios_ipa
+        shell: bash
+        run: |
+          IPA_PATH=$(find src-tauri/gen/apple/build -name '*.ipa' -print -quit)
+          echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: relayclip-ios-archive
+          path: src-tauri/gen/apple/build/**/*.ipa
+          if-no-files-found: error
+
+      - name: Upload to TestFlight
+        if: ${{ steps.ios_ipa.outputs.path != '' }}
+        shell: bash
+        run: |
+          xcrun altool --upload-app \
+            --type ios \
+            --file "${{ steps.ios_ipa.outputs.path }}" \
+            --apiKey "${{ secrets.APPLE_API_KEY_ID }}" \
+            --apiIssuer "${{ secrets.APPLE_API_ISSUER }}"
+
+  release:
+    name: Publish Release Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build_desktop
+      - build_android
+      - build_ios
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -92,3 +291,6 @@ jobs:
           files: |
             release-assets/relayclip-windows-installer/*.exe
             release-assets/relayclip-macos-installer/*.dmg
+            release-assets/relayclip-android-packages/**/*.apk
+            release-assets/relayclip-android-packages/**/*.aab
+            release-assets/relayclip-ios-archive/**/*.ipa

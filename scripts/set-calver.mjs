@@ -4,6 +4,16 @@ import process from 'node:process'
 
 const root = process.cwd()
 const timezone = process.env.RELAYCLIP_VERSION_TZ || 'Asia/Shanghai'
+const buildNumber = parseBuildNumber(process.env.RELAYCLIP_BUILD_NUMBER)
+
+function parseBuildNumber(rawValue) {
+  const parsed = Number.parseInt(rawValue ?? '1', 10)
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 1
+  }
+
+  return Math.min(parsed, 2_100_000_000)
+}
 
 function getCalendarVersion(timeZone) {
   const formatter = new Intl.DateTimeFormat('en-CA', {
@@ -31,10 +41,15 @@ function getCalendarVersion(timeZone) {
   return `${year}.${month}.${day}`
 }
 
-function updateJsonVersion(filePath, version) {
+function updateJsonVersion(filePath, version, mutate) {
+  if (!fs.existsSync(filePath)) {
+    return
+  }
+
   const raw = fs.readFileSync(filePath, 'utf8')
   const json = JSON.parse(raw)
   json.version = version
+  mutate?.(json)
   fs.writeFileSync(filePath, `${JSON.stringify(json, null, 2)}\n`)
 }
 
@@ -57,7 +72,17 @@ const version = getCalendarVersion(timezone)
 
 updateJsonVersion(path.join(root, 'package.json'), version)
 updateJsonVersion(path.join(root, 'src-tauri', 'tauri.conf.json'), version)
+updateJsonVersion(path.join(root, 'src-tauri', 'tauri.android.conf.json'), version, (json) => {
+  json.bundle ??= {}
+  json.bundle.android ??= {}
+  json.bundle.android.versionCode = buildNumber
+})
+updateJsonVersion(path.join(root, 'src-tauri', 'tauri.ios.conf.json'), version, (json) => {
+  json.bundle ??= {}
+  json.bundle.iOS ??= {}
+  json.bundle.iOS.bundleVersion = String(buildNumber)
+})
 updateCargoTomlVersion(path.join(root, 'src-tauri', 'Cargo.toml'), version)
 updateCargoLockVersion(path.join(root, 'src-tauri', 'Cargo.lock'), version)
 
-console.log(version)
+console.log(JSON.stringify({ version, buildNumber }))

@@ -1,6 +1,7 @@
 mod clipboard;
 mod discovery;
 mod i18n;
+mod mobile_bridge;
 mod models;
 mod runtime;
 mod store;
@@ -8,9 +9,12 @@ mod transport;
 mod transfers;
 mod tray;
 
-use crate::models::{AppStateSnapshot, ClipboardHistoryEntry, SettingsPatch, TransferJob, TrustedDevice};
+use crate::models::{
+    AppStateSnapshot, BackgroundSyncState, ClipboardHistoryEntry, RuntimeCapabilities,
+    RuntimePermissions, SettingsPatch, TransferJob, TrustedDevice,
+};
 use crate::runtime::RelayRuntime;
-use tauri::{Manager, State, WindowEvent};
+use tauri::{Manager, State};
 
 fn to_error_string(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -25,6 +29,24 @@ fn configure_macos_status_bar_app(app: &tauri::AppHandle) -> tauri::Result<()> {
 #[tauri::command]
 fn get_app_state(runtime: State<'_, RelayRuntime>) -> Result<AppStateSnapshot, String> {
     runtime.snapshot().map_err(to_error_string)
+}
+
+#[tauri::command]
+fn get_runtime_capabilities(runtime: State<'_, RelayRuntime>) -> Result<RuntimeCapabilities, String>
+{
+    Ok(runtime.runtime_capabilities())
+}
+
+#[tauri::command]
+fn request_runtime_permissions(runtime: State<'_, RelayRuntime>) -> Result<RuntimePermissions, String>
+{
+    Ok(runtime.request_runtime_permissions())
+}
+
+#[tauri::command]
+fn get_background_sync_state(runtime: State<'_, RelayRuntime>) -> Result<BackgroundSyncState, String>
+{
+    Ok(runtime.background_sync_state())
 }
 
 #[tauri::command]
@@ -88,6 +110,26 @@ fn place_received_transfer_on_clipboard(
 }
 
 #[tauri::command]
+fn share_received_transfer(
+    runtime: State<'_, RelayRuntime>,
+    transfer_id: String,
+) -> Result<(), String> {
+    runtime
+        .share_received_transfer(transfer_id)
+        .map_err(to_error_string)
+}
+
+#[tauri::command]
+fn export_received_transfer(
+    runtime: State<'_, RelayRuntime>,
+    transfer_id: String,
+) -> Result<(), String> {
+    runtime
+        .export_received_transfer(transfer_id)
+        .map_err(to_error_string)
+}
+
+#[tauri::command]
 fn dismiss_transfer_job(
     runtime: State<'_, RelayRuntime>,
     transfer_id: String,
@@ -122,27 +164,36 @@ fn open_cache_directory(runtime: State<'_, RelayRuntime>) -> Result<(), String> 
 pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
                 .build(),
         )
-        .plugin(tauri_plugin_autostart::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(mobile_bridge::init())
+        .plugin(tauri_plugin_notification::init());
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::Builder::new().build());
+    }
+
+    builder
         .setup(|app| {
             #[cfg(target_os = "macos")]
             configure_macos_status_bar_app(app.handle())?;
 
-            let relay = RelayRuntime::new(app.handle().clone())?;
+            let bridge = app.state::<mobile_bridge::RuntimeBridge>().inner().clone();
+            let relay = RelayRuntime::new(app.handle().clone(), bridge)?;
             relay.initialize()?;
             app.manage(relay.clone());
             tray::setup(app.handle(), relay)?;
             Ok(())
         })
         .on_window_event(|window, event| {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -150,6 +201,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
+            get_runtime_capabilities,
+            request_runtime_permissions,
+            get_background_sync_state,
             list_devices,
             set_device_pairing,
             toggle_sync,
@@ -157,6 +211,8 @@ pub fn run() {
             list_transfer_jobs,
             list_clipboard_history,
             place_received_transfer_on_clipboard,
+            share_received_transfer,
+            export_received_transfer,
             dismiss_transfer_job,
             cancel_transfer_job,
             restore_clipboard_history_entry,

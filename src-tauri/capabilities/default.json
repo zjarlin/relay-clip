@@ -12,6 +12,7 @@
   ],
   "permissions": [
     "core:default",
+    "core:app:default",
     "autostart:default",
     "notification:default"
   ]

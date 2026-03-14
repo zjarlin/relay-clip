@@ -1,6 +1,6 @@
 [package]
 name = "relayclip"
-version = "2026.3.13"
+version = "2026.3.14"
 description = "RelayClip cross-platform clipboard relay"
 authors = ["Codex"]
 license = ""

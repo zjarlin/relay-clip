@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "RelayClip",
-  "version": "2026.3.13",
+  "version": "2026.3.14",
   "identifier": "com.relayclip.desktop",
   "build": {
     "frontendDist": "../dist",

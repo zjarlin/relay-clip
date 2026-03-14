@@ -37,32 +37,22 @@
     TransferJob,
   } from './lib/types'
   import {
-    isPermissionGranted,
-    requestPermission,
-    sendNotification,
-  } from '@tauri-apps/plugin-notification'
-  import { Badge } from '$lib/components/ui/badge'
-  import { Button } from '$lib/components/ui/button'
-  import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card'
-  import { Input } from '$lib/components/ui/input'
-  import { Progress } from '$lib/components/ui/progress'
-  import { ScrollArea } from '$lib/components/ui/scroll-area'
-  import { Separator } from '$lib/components/ui/separator'
-  import { Switch } from '$lib/components/ui/switch'
-  import {
-    ClipboardList,
-    Copy,
-    Download,
-    FolderOpen,
-    Image,
-    Laptop2,
-    Link2,
-    Search,
-    Send,
-    Share2,
-    ShieldCheck,
+    MessageCircle,
+    Users,
+    Settings,
     Smartphone,
-    Type,
+    Laptop2,
+    Check,
+    X,
+    Link2,
+    Wifi,
+    WifiOff,
+    ChevronRight,
+    RotateCcw,
+    Download,
+    Share2,
+    Trash2,
+    AlertCircle,
   } from '@lucide/svelte'
 
   interface HistoryGroup {
@@ -102,6 +92,8 @@
   let settingsBusy = false
   let permissionsBusy = false
   let errorBanner: string | null = null
+  let activeTab: 'devices' | 'history' | 'settings' = 'devices'
+  let showDeviceDetail: string | null = null
   const notifiedReady = new Set<string>()
 
   $: currentLanguage =
@@ -128,16 +120,13 @@
   $: runtimeCapabilities = snapshot?.capabilities ?? fallbackCapabilities
   $: runtimePermissions = snapshot?.permissions ?? fallbackPermissions
   $: isMobile = runtimePlatform === 'android' || runtimePlatform === 'ios'
-  $: permissionRows = [
-    [copy.notificationsPermission, runtimePermissions.notifications],
-    [copy.localNetworkPermission, runtimePermissions.localNetwork],
-    [copy.clipboardPermission, runtimePermissions.clipboard],
-    [copy.fileAccessPermission, runtimePermissions.fileAccess],
-    [copy.backgroundSyncPermission, runtimePermissions.backgroundSync],
-  ] satisfies Array<[string, RuntimePermissionState]>
-  $: permissionsNeedAttention = permissionRows.some(([, state]) =>
-    ['prompt', 'denied'].includes(state),
-  )
+  $: permissionsNeedAttention = [
+    runtimePermissions.notifications,
+    runtimePermissions.localNetwork,
+    runtimePermissions.clipboard,
+    runtimePermissions.fileAccess,
+    runtimePermissions.backgroundSync,
+  ].some((state) => ['prompt', 'denied'].includes(state))
 
   async function refresh() {
     const [state, jobs, history, backgroundState] = await Promise.all([
@@ -308,17 +297,25 @@
     if (notifiedReady.has(job.transferId)) return
     notifiedReady.add(job.transferId)
 
-    let permissionGranted = await isPermissionGranted()
-    if (!permissionGranted) {
-      const permission = await requestPermission()
-      permissionGranted = permission === 'granted'
-    }
+    // 移动端暂不支持通知，跳过
+    if (isMobile) return
 
-    if (permissionGranted) {
-      await sendNotification({
-        title: copy.notificationTitle,
-        body: copy.notificationBody(job.displayName),
-      })
+    try {
+      const { isPermissionGranted, requestPermission, sendNotification } = await import('@tauri-apps/plugin-notification')
+      let permissionGranted = await isPermissionGranted()
+      if (!permissionGranted) {
+        const permission = await requestPermission()
+        permissionGranted = permission === 'granted'
+      }
+
+      if (permissionGranted) {
+        await sendNotification({
+          title: copy.notificationTitle,
+          body: copy.notificationBody(job.displayName),
+        })
+      }
+    } catch {
+      // 通知插件不可用，静默失败
     }
   }
 
@@ -375,14 +372,6 @@
     return platform
   }
 
-  function groupPlatform(group: HistoryGroup) {
-    if (group.isLocal) {
-      return localDevice?.platform ?? ''
-    }
-
-    return devices.find((device) => device.deviceId === group.deviceId)?.platform ?? ''
-  }
-
   function formatBytes(value: number) {
     if (value <= 0) return '0 B'
     const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -406,24 +395,32 @@
   }
 
   function formatTime(value: string) {
-    return new Intl.DateTimeFormat(currentLanguage === 'zh-CN' ? 'zh-CN' : 'en-US', {
-      month: 'numeric',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    }).format(new Date(value))
+    const date = new Date(value)
+    const now = new Date()
+    const diff = now.getTime() - date.getTime()
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24))
+
+    if (days === 0) {
+      return date.toLocaleTimeString(currentLanguage === 'zh-CN' ? 'zh-CN' : 'en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    } else if (days === 1) {
+      return '昨天'
+    } else if (days < 7) {
+      return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getDay()]
+    } else {
+      return date.toLocaleDateString(currentLanguage === 'zh-CN' ? 'zh-CN' : 'en-US', {
+        month: 'numeric',
+        day: 'numeric',
+      })
+    }
   }
 
   function historyPreview(entry: ClipboardHistoryEntry) {
     if (entry.previewText) return entry.previewText
     if (entry.topLevelNames.length > 0) return entry.topLevelNames.join(', ')
     return formatBytes(entry.size)
-  }
-
-  function statusVariant(state?: string | null): 'default' | 'secondary' | 'outline' {
-    if (state === 'connected' || state === 'syncing') return 'default'
-    if (state === 'error') return 'outline'
-    return 'secondary'
   }
 
   function hasAction(job: TransferJob, action: TransferAction) {
@@ -465,444 +462,1116 @@
 </script>
 
 {#if snapshot}
-  <main class="min-h-screen bg-muted/40 p-3 text-sm">
-    <div class="mx-auto flex max-w-[430px] flex-col gap-3">
-      <Card class="shadow-sm">
-        <CardHeader class="gap-3 pb-3">
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0 flex-1 space-y-2">
-              <div class="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
-                <Link2 class="size-3.5" />
-                <span>{copy.title}</span>
+  <div class="wechat-app">
+    <!-- Header -->
+    <header class="wechat-header">
+      <div class="header-title">RelayClip</div>
+      <div class="header-actions">
+        {#if syncStatus?.state === 'syncing'}
+          <span class="sync-indicator">
+            <span class="sync-dot"></span>
+            同步中
+          </span>
+        {:else if syncStatus?.state === 'connected'}
+          <span class="sync-status connected">已连接</span>
+        {:else}
+          <span class="sync-status">未连接</span>
+        {/if}
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="wechat-content">
+      {#if errorBanner}
+        <div class="error-toast">
+          <AlertCircle class="error-icon" size={16} />
+          <span>{errorBanner}</span>
+        </div>
+      {/if}
+
+      <!-- Devices Tab -->
+      {#if activeTab === 'devices'}
+        <div class="wechat-list">
+          <!-- My Device -->
+          <div class="list-section">
+            <div class="section-title">我的设备</div>
+            <div class="wechat-card">
+              <div class="device-item self">
+                <div class="device-avatar green">
+                  {#if isMobilePlatform(localDevice?.platform ?? '')}
+                    <Smartphone size={20} />
+                  {:else}
+                    <Laptop2 size={20} />
+                  {/if}
+                </div>
+                <div class="device-info">
+                  <div class="device-name">{snapshot.settings.deviceName}</div>
+                  <div class="device-meta">{platformLabel(localDevice?.platform ?? '')} · 本机</div>
+                </div>
+                <div class="device-action">
+                  <span class="badge primary">在线</span>
+                </div>
               </div>
-              <Input
-                class="h-9 text-sm font-semibold"
-                disabled={settingsBusy}
-                on:change={(event) =>
-                  patchSettings({ deviceName: (event.target as HTMLInputElement).value })}
-                spellcheck="false"
-                value={snapshot.settings.deviceName}
-              />
-            </div>
-            <div class="flex max-w-36 flex-col items-end gap-1 text-right">
-              <Badge variant={statusVariant(syncStatus?.state)}>
-                {copy.syncState(syncStatus?.state ?? 'idle')}
-              </Badge>
-              <p class="text-[11px] leading-4 text-muted-foreground">
-                {syncStatus?.message ?? ''}
-              </p>
             </div>
           </div>
-          {#if errorBanner}
-            <div class="rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-              {errorBanner}
-            </div>
-          {/if}
-        </CardHeader>
 
-        <CardContent class="space-y-3">
-          <div class="space-y-2">
-            <div class="flex items-center justify-between gap-3">
-              <div>
-                <CardTitle>{copy.pairedDevices}</CardTitle>
-                <CardDescription class="mt-1">
-                  {pairedDevices.length > 0
-                    ? copy.pairedDevicesCount(pairedDevices.length)
-                    : copy.noPairedDevicesHint}
-                </CardDescription>
-              </div>
-              <Badge variant="secondary">{copy.pairedDevicesCount(pairedDevices.length)}</Badge>
-            </div>
-
-            {#if pairedDevices.length === 0}
-              <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
-                <div class="font-medium text-foreground">{copy.noPairedDevices}</div>
-                <div class="mt-1">{copy.noPairedDevicesHint}</div>
-              </div>
-            {:else}
-              <div class="space-y-2">
-                {#each pairedDevices as device}
-                  <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-2">
-                    <div class="flex min-w-0 items-center gap-2">
+          <!-- Paired Devices -->
+          {#if pairedDevices.length > 0}
+            <div class="list-section">
+              <div class="section-title">已配对设备 ({pairedDevices.length})</div>
+              <div class="wechat-card">
+                {#each pairedDevices as device, i}
+                  <div class="device-item" class:border-bottom={i < pairedDevices.length - 1}>
+                    <div class="device-avatar" class:online={device.isOnline}>
                       {#if isMobilePlatform(device.platform)}
-                        <Smartphone class="size-3.5 text-muted-foreground" />
+                        <Smartphone size={20} />
                       {:else}
-                        <Laptop2 class="size-3.5 text-muted-foreground" />
+                        <Laptop2 size={20} />
                       {/if}
-                      <div class="min-w-0">
-                        <div class="truncate font-medium">{device.name}</div>
-                        <div class="text-xs text-muted-foreground">
-                          {platformLabel(device.platform)} · {device.isOnline ? copy.online : copy.offline}
-                        </div>
+                    </div>
+                    <div class="device-info">
+                      <div class="device-name">{device.name}</div>
+                      <div class="device-meta">
+                        {platformLabel(device.platform)} · {device.isOnline ? '在线' : '离线'}
                       </div>
                     </div>
-                    <Button
-                      disabled={busyPairingId === device.deviceId}
-                      on:click={() => updatePairing(device.deviceId, false)}
-                      size="sm"
-                      variant="outline"
-                    >
-                      {copy.unpair}
-                    </Button>
+                    <div class="device-action">
+                      <button
+                        class="btn-text danger"
+                        disabled={busyPairingId === device.deviceId}
+                        on:click={() => updatePairing(device.deviceId, false)}
+                      >
+                        取消配对
+                      </button>
+                    </div>
                   </div>
                 {/each}
               </div>
-            {/if}
-          </div>
-
-          <Separator />
-
-          <div class="space-y-2">
-            <div class="flex items-center gap-2 text-xs font-medium text-muted-foreground">
-              <Search class="size-3.5" />
-              <span>{copy.nearby}</span>
-            </div>
-
-            {#if nearbyDevices.length === 0}
-              <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
-                <div class="font-medium text-foreground">{copy.noNearbyDevices}</div>
-                <div class="mt-1">{copy.nearbyDevicesHint}</div>
-              </div>
-            {:else}
-              <div class="space-y-2">
-                {#each nearbyDevices as device}
-                  <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-2">
-                    <div class="flex min-w-0 items-center gap-2">
-                      {#if isMobilePlatform(device.platform)}
-                        <Smartphone class="size-3.5 text-muted-foreground" />
-                      {:else}
-                        <Laptop2 class="size-3.5 text-muted-foreground" />
-                      {/if}
-                      <div class="min-w-0">
-                        <div class="truncate font-medium">{device.name}</div>
-                        <div class="text-xs text-muted-foreground">
-                          {platformLabel(device.platform)}
-                        </div>
-                      </div>
-                    </div>
-                    <Button
-                      disabled={busyPairingId === device.deviceId}
-                      on:click={() => updatePairing(device.deviceId, true)}
-                      size="sm"
-                      variant="secondary"
-                    >
-                      {copy.pair}
-                    </Button>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card class="shadow-sm">
-        <CardHeader class="pb-3">
-          <div class="flex items-center gap-2">
-            <Smartphone class="size-4 text-muted-foreground" />
-            <CardTitle>{copy.environment}</CardTitle>
-          </div>
-          <CardDescription>{copy.runtimePlatform(runtimePlatform)}</CardDescription>
-        </CardHeader>
-        <CardContent class="space-y-3 pt-0">
-          <div class="rounded-lg border bg-background px-3 py-3">
-            <div class="flex items-center justify-between gap-3">
-              <div>
-                <div class="font-medium">{copy.runtimePlatform(runtimePlatform)}</div>
-                <div class="text-xs text-muted-foreground">
-                  {backgroundSyncState?.message ?? copy.mobileLimitedHint}
-                </div>
-              </div>
-              <Badge variant="outline">
-                {backgroundSyncState
-                  ? copy.backgroundMode(backgroundSyncState.mode, backgroundSyncState.active)
-                  : copy.runtimePlatform(runtimePlatform)}
-              </Badge>
-            </div>
-          </div>
-
-          {#if runtimeCapabilities.backgroundSync}
-            <div class="flex items-center justify-between gap-3 rounded-lg border bg-background px-3 py-3">
-              <div>
-                <div class="font-medium">{copy.backgroundSync}</div>
-                <div class="text-xs text-muted-foreground">
-                  {backgroundSyncState?.message ?? copy.backgroundSyncHint}
-                </div>
-              </div>
-              <Switch
-                checked={snapshot.settings.backgroundSyncEnabled}
-                disabled={settingsBusy}
-                on:change={(event) =>
-                  patchSettings({
-                    backgroundSyncEnabled: (event.target as HTMLInputElement).checked,
-                  })}
-              />
             </div>
           {/if}
 
-          <div class="space-y-2 rounded-lg border bg-background px-3 py-3">
-            <div class="flex items-center justify-between gap-3">
-              <div class="flex items-center gap-2">
-                <ShieldCheck class="size-4 text-muted-foreground" />
-                <div class="font-medium">{copy.permissions}</div>
-              </div>
-              {#if permissionsNeedAttention}
-                <Button
-                  disabled={permissionsBusy}
-                  on:click={refreshPermissions}
-                  size="sm"
-                  variant="secondary"
-                >
-                  {copy.requestPermissions}
-                </Button>
-              {/if}
-            </div>
-            <p class="text-xs text-muted-foreground">{copy.permissionsHint}</p>
-            <div class="space-y-2 text-xs">
-              {#each permissionRows as [label, state]}
-                <div class="flex items-center justify-between gap-3">
-                  <span>{label}</span>
-                  <Badge variant={state === 'granted' ? 'secondary' : 'outline'}>
-                    {copy.permissionState(state)}
-                  </Badge>
-                </div>
-              {/each}
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card class="shadow-sm">
-        <CardHeader class="pb-3">
-          <div class="flex items-center justify-between gap-3">
-            <div class="flex items-center gap-2">
-              <Send class="size-4 text-muted-foreground" />
-              <CardTitle>{copy.transfers}</CardTitle>
-            </div>
-            {#if isMobile}
-              <Badge variant="outline">{copy.mobileLimitedHint}</Badge>
-            {/if}
-          </div>
-        </CardHeader>
-        <CardContent class="pt-0">
-          {#if visibleTransferJobs.length === 0}
-            <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
-              {copy.noTransfers}
-            </div>
-          {:else}
-            <ScrollArea class="max-h-64 space-y-2 pr-1">
-              {#each visibleTransferJobs as job}
-                <div class="mb-2 space-y-2 rounded-lg border bg-background px-3 py-3">
-                  <div class="flex items-start justify-between gap-3">
-                    <div class="min-w-0">
-                      <div class="truncate font-medium">{job.displayName}</div>
-                      <div class="text-xs text-muted-foreground">
-                        {copy.transferState(job.stage, job.direction)}
-                      </div>
+          <!-- Nearby Devices -->
+          {#if nearbyDevices.length > 0}
+            <div class="list-section">
+              <div class="section-title">附近设备</div>
+              <div class="wechat-card">
+                {#each nearbyDevices as device, i}
+                  <div class="device-item" class:border-bottom={i < nearbyDevices.length - 1}>
+                    <div class="device-avatar gray">
+                      {#if isMobilePlatform(device.platform)}
+                        <Smartphone size={20} />
+                      {:else}
+                        <Laptop2 size={20} />
+                      {/if}
                     </div>
-                    <div class="shrink-0 text-[11px] text-muted-foreground">
-                      {copy.transferSummary(job.completedEntries, job.totalEntries)}
+                    <div class="device-info">
+                      <div class="device-name">{device.name}</div>
+                      <div class="device-meta">{platformLabel(device.platform)}</div>
+                    </div>
+                    <div class="device-action">
+                      <button
+                        class="btn-text primary"
+                        disabled={busyPairingId === device.deviceId}
+                        on:click={() => updatePairing(device.deviceId, true)}
+                      >
+                        配对
+                      </button>
                     </div>
                   </div>
+                {/each}
+              </div>
+            </div>
+          {:else if pairedDevices.length === 0}
+            <div class="empty-state">
+              <div class="empty-icon">
+                <WifiOff size={48} />
+              </div>
+              <div class="empty-text">未发现附近设备</div>
+              <div class="empty-subtext">确保其他设备已开启 RelayClip 并在同一网络</div>
+            </div>
+          {/if}
+        </div>
 
-                  <Progress value={progress(job)} />
-
-                  <div class="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
+        <!-- Active Transfers -->
+        {#if visibleTransferJobs.length > 0}
+          <div class="list-section">
+            <div class="section-title">传输任务</div>
+            <div class="wechat-card">
+              {#each visibleTransferJobs as job, i}
+                <div class="transfer-item" class:border-bottom={i < visibleTransferJobs.length - 1}>
+                  <div class="transfer-header">
+                    <span class="transfer-name">{job.displayName}</span>
+                    <span class="transfer-time">{formatTime(job.startedAt)}</span>
+                  </div>
+                  <div class="transfer-progress">
+                    <div class="progress-bar">
+                      <div class="progress-fill" style="width: {progress(job)}%"></div>
+                    </div>
+                    <span class="progress-text">{progress(job)}%</span>
+                  </div>
+                  <div class="transfer-meta">
                     <span>{formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)}</span>
-                    <span>
-                      {#if job.warningMessage}
-                        {job.warningMessage}
+                    <span class="transfer-status">
+                      {#if job.stage === 'ready'}
+                        {#if job.direction === 'inbound'}
+                          <span class="status-ready">待接收</span>
+                        {:else}
+                          <span class="status-done">已完成</span>
+                        {/if}
+                      {:else if job.stage === 'downloading'}
+                        <span class="status-active">传输中</span>
+                      {:else if job.stage === 'preparing'}
+                        <span>准备中</span>
                       {:else if job.errorMessage}
-                        {job.errorMessage}
-                      {:else if job.stage === 'ready' && job.direction === 'inbound'}
-                        {copy.readyToPaste}
-                      {:else if job.stage === 'ready'}
-                        {copy.hiddenReadyState(job.readyActionState)}
+                        <span class="status-error">失败</span>
                       {/if}
                     </span>
                   </div>
-                  {#if job.stage === 'ready' && job.direction === 'inbound' && job.readyActionState === 'pendingPrompt'}
-                    {#if job.availableActions.length > 0}
-                      <div class="flex flex-wrap items-center justify-end gap-2">
-                        {#if hasAction(job, 'placeOnClipboard')}
-                          <Button
-                            disabled={busyTransferId === job.transferId}
-                            on:click={() => placeTransfer(job)}
-                            size="sm"
-                          >
-                            {copy.placeOnClipboard}
-                          </Button>
-                        {/if}
-                        {#if hasAction(job, 'shareExternally')}
-                          <Button
-                            disabled={busyTransferId === job.transferId}
-                            on:click={() => shareTransfer(job)}
-                            size="sm"
-                            variant="secondary"
-                          >
-                            <Share2 class="size-3.5" />
-                            {copy.shareExternally}
-                          </Button>
-                        {/if}
-                        {#if hasAction(job, 'exportToFiles')}
-                          <Button
-                            disabled={busyTransferId === job.transferId}
-                            on:click={() => exportTransfer(job)}
-                            size="sm"
-                            variant="outline"
-                          >
-                            <Download class="size-3.5" />
-                            {copy.exportToFiles}
-                          </Button>
-                        {/if}
-                        <Button
-                          disabled={busyTransferId === job.transferId}
-                          on:click={() => dismissTransfer(job)}
-                          size="sm"
-                          variant="outline"
-                        >
-                          {copy.dismiss}
-                        </Button>
-                      </div>
+                  {#if job.stage === 'ready' && job.direction === 'inbound'}
+                    <div class="transfer-actions">
                       {#if hasAction(job, 'placeOnClipboard')}
-                        <p class="text-[11px] text-muted-foreground">{copy.replaceWarning}</p>
+                        <button
+                          class="btn-primary"
+                          disabled={busyTransferId === job.transferId}
+                          on:click={() => placeTransfer(job)}
+                        >
+                          复制到剪贴板
+                        </button>
                       {/if}
-                    {:else}
-                      <p class="text-[11px] text-muted-foreground">{copy.actionsUnavailable}</p>
-                    {/if}
+                      {#if hasAction(job, 'shareExternally')}
+                        <button
+                          class="btn-secondary"
+                          disabled={busyTransferId === job.transferId}
+                          on:click={() => shareTransfer(job)}
+                        >
+                          <Share2 size={14} />
+                          分享
+                        </button>
+                      {/if}
+                      {#if hasAction(job, 'exportToFiles')}
+                        <button
+                          class="btn-secondary"
+                          disabled={busyTransferId === job.transferId}
+                          on:click={() => exportTransfer(job)}
+                        >
+                          <Download size={14} />
+                          保存
+                        </button>
+                      {/if}
+                      <button
+                        class="btn-ghost"
+                        disabled={busyTransferId === job.transferId}
+                        on:click={() => dismissTransfer(job)}
+                      >
+                        忽略
+                      </button>
+                    </div>
                   {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
-                    <div class="flex justify-end">
-                      <Button
+                    <div class="transfer-actions">
+                      <button
+                        class="btn-ghost"
                         disabled={busyTransferId === job.transferId}
                         on:click={() => cancelTransfer(job)}
-                        size="sm"
-                        variant="outline"
                       >
-                        {copy.cancel}
-                      </Button>
+                        取消
+                      </button>
                     </div>
                   {/if}
                 </div>
               {/each}
-            </ScrollArea>
-          {/if}
-        </CardContent>
-      </Card>
-
-      <Card class="shadow-sm">
-        <CardHeader class="pb-3">
-          <div class="flex items-center justify-between gap-3">
-            <div class="flex items-center gap-2">
-              <ClipboardList class="size-4 text-muted-foreground" />
-              <CardTitle>{copy.copyCenter}</CardTitle>
             </div>
-            {#if runtimeCapabilities.openCacheDirectory}
-              <Button on:click={openCache} size="sm" variant="ghost">
-                <FolderOpen class="size-4" />
-                {copy.openCacheDirectory}
-              </Button>
-            {/if}
           </div>
-        </CardHeader>
-        <CardContent class="pt-0">
+        {/if}
+      {/if}
+
+      <!-- History Tab -->
+      {#if activeTab === 'history'}
+        <div class="wechat-list">
           {#if historyGroups.length === 0}
-            <div class="rounded-lg border border-dashed bg-background px-3 py-3 text-xs text-muted-foreground">
-              {copy.noClipboardHistory}
+            <div class="empty-state">
+              <div class="empty-icon">
+                <MessageCircle size={48} />
+              </div>
+              <div class="empty-text">暂无剪贴板记录</div>
+              <div class="empty-subtext">同步开启后将自动记录剪贴板内容</div>
             </div>
           {:else}
-            <ScrollArea class="max-h-[30rem] pr-1">
-              <div class="space-y-3">
-                {#each historyGroups as group}
-                  <div class="rounded-lg border bg-background">
-                    <div class="flex items-center justify-between gap-3 border-b px-3 py-2">
-                      <div class="flex min-w-0 items-center gap-2">
-                        {#if isMobilePlatform(groupPlatform(group))}
-                          <Smartphone class="size-3.5 text-muted-foreground" />
-                        {:else}
-                          <Laptop2 class="size-3.5 text-muted-foreground" />
-                        {/if}
-                        <div class="truncate font-medium">{group.deviceName}</div>
-                        {#if group.isLocal}
-                          <Badge variant="secondary">{copy.thisDevice}</Badge>
-                        {/if}
-                      </div>
-                      <div class="text-[11px] text-muted-foreground">
-                        {copy.clips(group.entries.length)}
-                      </div>
-                    </div>
-
-                    <div class="space-y-2 p-2">
-                      {#each group.entries as entry}
-                        <div class="rounded-md border px-3 py-2">
-                          <div class="flex items-start justify-between gap-3">
-                            <div class="flex min-w-0 items-start gap-2">
-                              <div class="mt-0.5 text-muted-foreground">
-                                {#if entry.kind === 'text'}
-                                  <Type class="size-4" />
-                                {:else if entry.kind === 'image'}
-                                  <Image class="size-4" />
-                                {:else}
-                                  <ClipboardList class="size-4" />
-                                {/if}
-                              </div>
-                              <div class="min-w-0">
-                                <div class="truncate font-medium">{entry.displayName}</div>
-                                <div class="text-xs text-muted-foreground">
-                                  {copy.historyKind(entry.kind, entry.fileCount)} · {copy.historySource(entry.source)}
-                                </div>
-                              </div>
-                            </div>
-                            <div class="shrink-0 text-[11px] text-muted-foreground">
-                              {formatTime(entry.createdAt)}
-                            </div>
-                          </div>
-
-                          <p class="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">
-                            {historyPreview(entry)}
-                          </p>
-
-                          <div class="mt-2 flex justify-end">
-                            <Button
-                              disabled={busyHistoryId === entry.entryId}
-                              on:click={() => restoreHistory(entry)}
-                              size="sm"
-                              variant="outline"
-                            >
-                              <Copy class="size-3.5" />
-                              {copy.restoreHistory}
-                            </Button>
-                          </div>
+            {#each historyGroups as group}
+              <div class="list-section">
+                <div class="section-title">
+                  {group.deviceName}
+                  {#if group.isLocal}
+                    <span class="badge">本机</span>
+                  {/if}
+                </div>
+                <div class="wechat-card">
+                  {#each group.entries as entry, i}
+                    <div class="history-item" class:border-bottom={i < group.entries.length - 1}>
+                      <div class="history-content">
+                        <div class="history-title">{entry.displayName}</div>
+                        <div class="history-preview">{historyPreview(entry)}</div>
+                        <div class="history-meta">
+                          <span>{formatTime(entry.createdAt)}</span>
+                          <span>·</span>
+                          <span>{formatBytes(entry.size)}</span>
                         </div>
-                      {/each}
+                      </div>
+                      <button
+                        class="btn-icon"
+                        disabled={busyHistoryId === entry.entryId}
+                        on:click={() => restoreHistory(entry)}
+                        title="恢复"
+                      >
+                        <RotateCcw size={18} />
+                      </button>
                     </div>
-                  </div>
-                {/each}
+                  {/each}
+                </div>
               </div>
-            </ScrollArea>
+            {/each}
           {/if}
-        </CardContent>
-      </Card>
+        </div>
+      {/if}
 
-      <Card class="shadow-sm">
-        <CardContent class="flex items-center justify-between gap-3 py-3">
-          <div>
-            <div class="font-medium">{copy.syncEnabled}</div>
-            <div class="text-xs text-muted-foreground">{syncStatus?.message ?? ''}</div>
+      <!-- Settings Tab -->
+      {#if activeTab === 'settings'}
+        <div class="wechat-list">
+          <!-- Sync Settings -->
+          <div class="list-section">
+            <div class="section-title">同步设置</div>
+            <div class="wechat-card">
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">设备名称</div>
+                </div>
+                <div class="setting-control">
+                  <input
+                    type="text"
+                    class="wechat-input"
+                    value={snapshot.settings.deviceName}
+                    on:change={(e) => patchSettings({ deviceName: e.currentTarget.value })}
+                    disabled={settingsBusy}
+                  />
+                </div>
+              </div>
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">剪贴板同步</div>
+                  <div class="setting-desc">自动同步剪贴板内容到配对设备</div>
+                </div>
+                <div class="setting-control">
+                  <label class="wechat-switch">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.settings.syncEnabled}
+                      on:change={(e) => toggleClipboardSync(e.currentTarget.checked)}
+                      disabled={settingsBusy}
+                    />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+              </div>
+              {#if runtimeCapabilities.backgroundSync}
+                <div class="setting-item">
+                  <div class="setting-info">
+                    <div class="setting-name">后台同步</div>
+                    <div class="setting-desc">应用后台运行时保持同步</div>
+                  </div>
+                  <div class="setting-control">
+                    <label class="wechat-switch">
+                      <input
+                        type="checkbox"
+                        checked={snapshot.settings.backgroundSyncEnabled}
+                        on:change={(e) => patchSettings({ backgroundSyncEnabled: e.currentTarget.checked })}
+                        disabled={settingsBusy}
+                      />
+                      <span class="switch-slider"></span>
+                    </label>
+                  </div>
+                </div>
+              {/if}
+            </div>
           </div>
-          <Switch
-            checked={snapshot.settings.syncEnabled}
-            disabled={settingsBusy}
-            on:change={(event) =>
-              toggleClipboardSync((event.target as HTMLInputElement).checked)}
-          />
-        </CardContent>
-      </Card>
-    </div>
-  </main>
+
+          <!-- Permissions -->
+          <div class="list-section">
+            <div class="section-title">权限状态</div>
+            <div class="wechat-card">
+              {#each [
+                ['通知权限', runtimePermissions.notifications],
+                ['本地网络', runtimePermissions.localNetwork],
+                ['剪贴板访问', runtimePermissions.clipboard],
+                ['文件访问', runtimePermissions.fileAccess],
+                ['后台同步', runtimePermissions.backgroundSync],
+              ] as [label, state]}
+                <div class="permission-item">
+                  <span class="permission-name">{label}</span>
+                  <span class="permission-status" class:granted={state === 'granted'}>
+                    {#if state === 'granted'}
+                      <Check size={14} />
+                      已授权
+                    {:else if state === 'denied'}
+                      <X size={14} />
+                      已拒绝
+                    {:else if state === 'prompt'}
+                      待请求
+                    {:else}
+                      不支持
+                    {/if}
+                  </span>
+                </div>
+              {/each}
+              {#if permissionsNeedAttention}
+                <div class="permission-action">
+                  <button
+                    class="btn-primary full"
+                    disabled={permissionsBusy}
+                    on:click={refreshPermissions}
+                  >
+                    请求权限
+                  </button>
+                </div>
+              {/if}
+            </div>
+          </div>
+
+          <!-- About -->
+          <div class="list-section">
+            <div class="section-title">关于</div>
+            <div class="wechat-card">
+              <div class="info-item">
+                <span>版本</span>
+                <span class="info-value">2026.3.14</span>
+              </div>
+              <div class="info-item">
+                <span>平台</span>
+                <span class="info-value">{runtimePlatform}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      {/if}
+    </main>
+
+    <!-- Tab Bar -->
+    <nav class="wechat-tabbar">
+      <button
+        class="tab-item"
+        class:active={activeTab === 'devices'}
+        on:click={() => activeTab = 'devices'}
+      >
+        <div class="tab-icon">
+          <Link2 size={24} />
+        </div>
+        <span class="tab-label">设备</span>
+      </button>
+      <button
+        class="tab-item"
+        class:active={activeTab === 'history'}
+        on:click={() => activeTab = 'history'}
+      >
+        <div class="tab-icon">
+          <MessageCircle size={24} />
+        </div>
+        <span class="tab-label">记录</span>
+      </button>
+      <button
+        class="tab-item"
+        class:active={activeTab === 'settings'}
+        on:click={() => activeTab = 'settings'}
+      >
+        <div class="tab-icon">
+          <Settings size={24} />
+        </div>
+        <span class="tab-label">设置</span>
+      </button>
+    </nav>
+  </div>
 {:else}
-  <main class="flex min-h-screen items-center justify-center bg-muted/40 p-4">
-    <Card class="w-full max-w-sm shadow-sm">
-      <CardContent class="py-10 text-center text-sm text-muted-foreground">RelayClip</CardContent>
-    </Card>
-  </main>
+  <div class="wechat-app loading">
+    <div class="loading-spinner"></div>
+    <span>RelayClip</span>
+  </div>
 {/if}
+
+<style>
+  :global(body) {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: #ededed;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wechat-app {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    max-width: 430px;
+    margin: 0 auto;
+    background: #ededed;
+    position: relative;
+  }
+
+  .wechat-app.loading {
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: #999;
+  }
+
+  .loading-spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid #e0e0e0;
+    border-top-color: #07c160;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  /* Header */
+  .wechat-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: #ededed;
+    border-bottom: 0.5px solid #d9d9d9;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .header-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: #000;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .sync-indicator {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    color: #07c160;
+  }
+
+  .sync-dot {
+    width: 6px;
+    height: 6px;
+    background: #07c160;
+    border-radius: 50%;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .sync-status {
+    font-size: 13px;
+    color: #999;
+  }
+
+  .sync-status.connected {
+    color: #07c160;
+  }
+
+  /* Content */
+  .wechat-content {
+    flex: 1;
+    overflow-y: auto;
+    padding-bottom: 80px;
+  }
+
+  .error-toast {
+    margin: 12px 16px;
+    padding: 10px 12px;
+    background: #fa5151;
+    color: white;
+    border-radius: 6px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .error-icon {
+    flex-shrink: 0;
+  }
+
+  /* List Sections */
+  .wechat-list {
+    padding-top: 12px;
+  }
+
+  .list-section {
+    margin-bottom: 16px;
+  }
+
+  .section-title {
+    padding: 0 16px 8px;
+    font-size: 13px;
+    color: #999;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Cards */
+  .wechat-card {
+    margin: 0 16px;
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+
+  /* Device Items */
+  .device-item {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    gap: 12px;
+  }
+
+  .device-item.border-bottom {
+    border-bottom: 0.5px solid #e5e5e5;
+  }
+
+  .device-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 6px;
+    background: #e5e5e5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #999;
+    flex-shrink: 0;
+  }
+
+  .device-avatar.green {
+    background: #07c160;
+    color: white;
+  }
+
+  .device-avatar.online {
+    background: #e8f5e9;
+    color: #07c160;
+  }
+
+  .device-avatar.gray {
+    background: #f5f5f5;
+    color: #999;
+  }
+
+  .device-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .device-name {
+    font-size: 16px;
+    font-weight: 500;
+    color: #000;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .device-meta {
+    font-size: 13px;
+    color: #999;
+    margin-top: 2px;
+  }
+
+  .device-action {
+    flex-shrink: 0;
+  }
+
+  /* Transfer Items */
+  .transfer-item {
+    padding: 16px;
+  }
+
+  .transfer-item.border-bottom {
+    border-bottom: 0.5px solid #e5e5e5;
+  }
+
+  .transfer-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+
+  .transfer-name {
+    font-size: 15px;
+    font-weight: 500;
+    color: #000;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 70%;
+  }
+
+  .transfer-time {
+    font-size: 12px;
+    color: #999;
+  }
+
+  .transfer-progress {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+
+  .progress-bar {
+    flex: 1;
+    height: 4px;
+    background: #e5e5e5;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: #07c160;
+    border-radius: 2px;
+    transition: width 0.3s ease;
+  }
+
+  .progress-text {
+    font-size: 12px;
+    color: #999;
+    min-width: 36px;
+    text-align: right;
+  }
+
+  .transfer-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: #999;
+    margin-bottom: 12px;
+  }
+
+  .transfer-status {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .status-ready {
+    color: #ff9500;
+  }
+
+  .status-done {
+    color: #07c160;
+  }
+
+  .status-active {
+    color: #576b95;
+  }
+
+  .status-error {
+    color: #fa5151;
+  }
+
+  .transfer-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  /* History Items */
+  .history-item {
+    display: flex;
+    align-items: flex-start;
+    padding: 12px 16px;
+    gap: 12px;
+  }
+
+  .history-item.border-bottom {
+    border-bottom: 0.5px solid #e5e5e5;
+  }
+
+  .history-content {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .history-title {
+    font-size: 15px;
+    font-weight: 500;
+    color: #000;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 4px;
+  }
+
+  .history-preview {
+    font-size: 13px;
+    color: #666;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+
+  .history-meta {
+    font-size: 12px;
+    color: #999;
+    display: flex;
+    gap: 4px;
+  }
+
+  /* Settings */
+  .setting-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 0.5px solid #e5e5e5;
+  }
+
+  .setting-item:last-child {
+    border-bottom: none;
+  }
+
+  .setting-info {
+    flex: 1;
+  }
+
+  .setting-name {
+    font-size: 16px;
+    color: #000;
+  }
+
+  .setting-desc {
+    font-size: 13px;
+    color: #999;
+    margin-top: 2px;
+  }
+
+  .setting-control {
+    flex-shrink: 0;
+  }
+
+  .wechat-input {
+    width: 140px;
+    padding: 6px 10px;
+    border: 0.5px solid #e5e5e5;
+    border-radius: 4px;
+    font-size: 15px;
+    text-align: right;
+    background: #f5f5f5;
+  }
+
+  .wechat-input:focus {
+    outline: none;
+    border-color: #07c160;
+    background: white;
+  }
+
+  /* Switch */
+  .wechat-switch {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 30px;
+  }
+
+  .wechat-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .switch-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #e5e5e5;
+    transition: 0.3s;
+    border-radius: 30px;
+  }
+
+  .switch-slider:before {
+    position: absolute;
+    content: "";
+    height: 26px;
+    width: 26px;
+    left: 2px;
+    bottom: 2px;
+    background-color: white;
+    transition: 0.3s;
+    border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  }
+
+  input:checked + .switch-slider {
+    background-color: #07c160;
+  }
+
+  input:checked + .switch-slider:before {
+    transform: translateX(20px);
+  }
+
+  /* Permissions */
+  .permission-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 0.5px solid #e5e5e5;
+  }
+
+  .permission-item:last-child {
+    border-bottom: none;
+  }
+
+  .permission-name {
+    font-size: 16px;
+    color: #000;
+  }
+
+  .permission-status {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 14px;
+    color: #999;
+  }
+
+  .permission-status.granted {
+    color: #07c160;
+  }
+
+  .permission-action {
+    padding: 12px 16px;
+    border-top: 0.5px solid #e5e5e5;
+  }
+
+  /* Info Items */
+  .info-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 12px 16px;
+    font-size: 16px;
+    color: #000;
+    border-bottom: 0.5px solid #e5e5e5;
+  }
+
+  .info-item:last-child {
+    border-bottom: none;
+  }
+
+  .info-value {
+    color: #999;
+  }
+
+  /* Buttons */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 8px 16px;
+    background: #07c160;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .btn-primary:active {
+    background: #06ad56;
+  }
+
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-primary.full {
+    width: 100%;
+  }
+
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 8px 14px;
+    background: #f5f5f5;
+    color: #333;
+    border: 0.5px solid #e5e5e5;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .btn-secondary:active {
+    background: #e8e8e8;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px 14px;
+    background: transparent;
+    color: #576b95;
+    border: none;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .btn-text {
+    background: none;
+    border: none;
+    font-size: 14px;
+    cursor: pointer;
+    padding: 4px 8px;
+  }
+
+  .btn-text.primary {
+    color: #576b95;
+  }
+
+  .btn-text.danger {
+    color: #fa5151;
+  }
+
+  .btn-icon {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f5f5f5;
+    border: none;
+    border-radius: 50%;
+    color: #666;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .btn-icon:active {
+    background: #e8e8e8;
+  }
+
+  /* Badges */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    background: #e5e5e5;
+    color: #666;
+    font-size: 11px;
+    border-radius: 3px;
+  }
+
+  .badge.primary {
+    background: #e8f5e9;
+    color: #07c160;
+  }
+
+  /* Empty State */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 32px;
+    text-align: center;
+  }
+
+  .empty-icon {
+    color: #d9d9d9;
+    margin-bottom: 16px;
+  }
+
+  .empty-text {
+    font-size: 16px;
+    color: #999;
+    margin-bottom: 8px;
+  }
+
+  .empty-subtext {
+    font-size: 13px;
+    color: #bbb;
+    line-height: 1.5;
+  }
+
+  /* Tab Bar */
+  .wechat-tabbar {
+    position: fixed;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100%;
+    max-width: 430px;
+    display: flex;
+    background: #f7f7f7;
+    border-top: 0.5px solid #d9d9d9;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+
+  .tab-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #999;
+  }
+
+  .tab-item.active {
+    color: #07c160;
+  }
+
+  .tab-icon {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .tab-label {
+    font-size: 10px;
+    margin-top: 2px;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+</style>

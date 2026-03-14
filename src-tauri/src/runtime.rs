@@ -8,12 +8,12 @@ use crate::models::{
     TransferKind, TransferStage, TrustedDevice,
 };
 use crate::store;
+use crate::transfers::{self, LocalFileClipboard};
 use crate::transport::{self, ClipboardEnvelope, IncomingTransferOffer};
 use crate::tray;
-use crate::transfers::{self, LocalFileClipboard};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -61,6 +61,7 @@ struct RuntimeInner {
     clipboard_history: RwLock<Vec<ClipboardHistoryEntry>>,
     presence: RwLock<HashMap<String, DevicePresence>>,
     active_device_ids: RwLock<Vec<String>>,
+    auto_pair_blocked_device_ids: Mutex<HashSet<String>>,
     service_map: Mutex<HashMap<String, String>>,
     recent_hashes: Mutex<VecDeque<String>>,
     sync_status: RwLock<SyncStatus>,
@@ -91,7 +92,7 @@ struct DevicePresence {
 struct ActiveTarget {
     device_id: String,
     fingerprint: String,
-    socket_addr: SocketAddr,
+    socket_addrs: Vec<SocketAddr>,
 }
 
 impl RelayRuntime {
@@ -119,6 +120,7 @@ impl RelayRuntime {
                 clipboard_history: RwLock::new(std::mem::take(&mut clipboard_history)),
                 presence: RwLock::new(HashMap::new()),
                 active_device_ids: RwLock::new(Vec::new()),
+                auto_pair_blocked_device_ids: Mutex::new(HashSet::new()),
                 service_map: Mutex::new(HashMap::new()),
                 recent_hashes: Mutex::new(VecDeque::new()),
                 sync_status: RwLock::new(sync_status),
@@ -212,50 +214,15 @@ impl RelayRuntime {
         if device_id == local_device_id {
             bail!("cannot pair this device with itself");
         }
-        let presence = self
-            .inner
-            .presence
-            .read()
-            .map_err(|_| anyhow!("presence lock poisoned"))?;
-        let Some(device) = presence.get(&device_id) else {
-            bail!("unknown device");
-        };
-        if !device.is_online {
-            bail!("device is offline");
-        }
-        let target = ActiveTarget {
-            device_id: device.device_id.clone(),
-            fingerprint: device.fingerprint.clone(),
-            socket_addr: preferred_socket_addr(&device.addresses, device.port)
-                .ok_or_else(|| anyhow!("the paired device has no routable address"))?,
-        };
-        drop(presence);
+        let target = self.active_target_for(&device_id)?;
         self.set_device_paired_state(&device_id, paired);
+        self.set_auto_pair_blocked(&device_id, !paired);
 
         self.refresh_sync_summary();
         self.emit_devices_updated();
         self.emit_sync_status_changed();
 
-        let runtime = self.clone();
-        let local_device_id = local_device_id.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = transport::send_device_pairing_update(
-                target.socket_addr,
-                &target.fingerprint,
-                transport::DevicePairingUpdate {
-                    origin_device_id: local_device_id,
-                    target_device_id: device_id,
-                    paired,
-                },
-            )
-            .await
-            {
-                log::warn!("failed to sync device pairing to peer: {error}");
-                runtime.refresh_sync_summary();
-                runtime.emit_devices_updated();
-                runtime.emit_sync_status_changed();
-            }
-        });
+        self.spawn_device_pairing_sync(target, device_id, paired);
 
         self.snapshot()
     }
@@ -385,7 +352,9 @@ impl RelayRuntime {
                 sequence,
             );
 
-            match transport::send_envelope(target.socket_addr, &target.fingerprint, envelope).await {
+            match transport::send_envelope(&target.socket_addrs, &target.fingerprint, envelope)
+                .await
+            {
                 Ok(_) => self.record_device_sync(
                     &target.device_id,
                     i18n::relayed(language, &packet.meta.kind),
@@ -407,7 +376,11 @@ impl RelayRuntime {
 
         self.remember_hash(file_list.hash.clone());
         let local_device = self.local_device();
-        let _ = self.record_local_file_history(&file_list, &local_device.device_id, &local_device.device_name);
+        let _ = self.record_local_file_history(
+            &file_list,
+            &local_device.device_id,
+            &local_device.device_name,
+        );
 
         let targets = match self.active_targets() {
             Ok(targets) if targets.is_empty() => return,
@@ -545,7 +518,8 @@ impl RelayRuntime {
         };
         self.upsert_transfer_job(job, true)?;
 
-        let staging_root = store::transfers_root_path(&self.inner.state_path).join(&offer.transfer_id);
+        let staging_root =
+            store::transfers_root_path(&self.inner.state_path).join(&offer.transfer_id);
         if staging_root.exists() {
             let _ = std::fs::remove_dir_all(&staging_root);
         }
@@ -570,7 +544,10 @@ impl RelayRuntime {
             }
         }
 
-        Ok(IncomingTransferPreparation { staging_root, lease })
+        Ok(IncomingTransferPreparation {
+            staging_root,
+            lease,
+        })
     }
 
     pub fn complete_incoming_transfer(&self, transfer_id: &str) -> Result<()> {
@@ -791,9 +768,10 @@ impl RelayRuntime {
                 .service_map
                 .lock()
                 .map_err(|_| anyhow!("service map lock poisoned"))?;
-            service_map.insert(peer.service_fullname, peer.device_id);
+            service_map.insert(peer.service_fullname.clone(), peer.device_id.clone());
         }
 
+        self.maybe_auto_pair_discovered_device(&peer);
         self.refresh_sync_summary();
         self.emit_devices_updated();
         Ok(())
@@ -872,6 +850,7 @@ impl RelayRuntime {
         drop(presence);
 
         self.set_device_paired_state(origin_device_id, paired);
+        self.set_auto_pair_blocked(origin_device_id, !paired);
         self.refresh_sync_summary();
         self.emit_devices_updated();
         self.emit_sync_status_changed();
@@ -1065,25 +1044,33 @@ impl RelayRuntime {
         paths: Vec<PathBuf>,
         cancel_flag: Arc<AtomicBool>,
     ) {
-        let prepared = match tauri::async_runtime::spawn_blocking(move || transfers::prepare_transfer(&paths))
-            .await
-        {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(error)) => {
-                let _ = self.fail_transfer(&transfer_id, error.to_string());
-                return;
-            }
-            Err(error) => {
-                let _ = self.fail_transfer(&transfer_id, format!("prepare transfer join error: {error}"));
-                return;
-            }
-        };
+        let prepared =
+            match tauri::async_runtime::spawn_blocking(move || transfers::prepare_transfer(&paths))
+                .await
+            {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    let _ = self.fail_transfer(&transfer_id, error.to_string());
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.fail_transfer(
+                        &transfer_id,
+                        format!("prepare transfer join error: {error}"),
+                    );
+                    return;
+                }
+            };
 
         let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
             job.display_name = prepared.display_name.clone();
             job.total_bytes = prepared.total_bytes;
             job.total_entries = prepared.total_entries();
-            job.entries = prepared.entries.iter().map(|entry| entry.entry.clone()).collect();
+            job.entries = prepared
+                .entries
+                .iter()
+                .map(|entry| entry.entry.clone())
+                .collect();
             job.top_level_names = prepared.top_level_names.clone();
             job.warning_message = prepared.warning_message.clone();
         });
@@ -1109,14 +1096,18 @@ impl RelayRuntime {
             display_name: prepared.display_name.clone(),
             total_bytes: prepared.total_bytes,
             total_entries: prepared.total_entries(),
-            entries: prepared.entries.iter().map(|entry| entry.entry.clone()).collect(),
+            entries: prepared
+                .entries
+                .iter()
+                .map(|entry| entry.entry.clone())
+                .collect(),
             top_level_names: prepared.top_level_names.clone(),
             warning_message: prepared.warning_message.clone(),
         };
 
         let result = transport::send_transfer(
             self.clone(),
-            target.socket_addr,
+            &target.socket_addrs,
             &target.fingerprint,
             offer,
             prepared,
@@ -1202,23 +1193,25 @@ impl RelayRuntime {
         let mut devices = presence
             .values()
             .filter(|device| device.device_id != local_device_id)
-            .map(|device| {
-                TrustedDevice {
-                    device_id: device.device_id.clone(),
-                    name: device.name.clone(),
-                    platform: device.platform.clone(),
-                    fingerprint: device.fingerprint.clone(),
-                    auto_trusted: false,
-                    capabilities: device.capabilities.clone(),
-                    last_seen: Some(device.last_seen),
-                    last_sync_at: device.last_sync_at,
-                    last_sync_status: device.last_sync_status.clone(),
-                    addresses: device.addresses.iter().map(|address| address.to_string()).collect(),
-                    host_name: device.host_name.clone(),
-                    port: Some(device.port),
-                    is_online: device.is_online,
-                    is_active: active_device_ids.iter().any(|id| id == &device.device_id),
-                }
+            .map(|device| TrustedDevice {
+                device_id: device.device_id.clone(),
+                name: device.name.clone(),
+                platform: device.platform.clone(),
+                fingerprint: device.fingerprint.clone(),
+                auto_trusted: false,
+                capabilities: device.capabilities.clone(),
+                last_seen: Some(device.last_seen),
+                last_sync_at: device.last_sync_at,
+                last_sync_status: device.last_sync_status.clone(),
+                addresses: device
+                    .addresses
+                    .iter()
+                    .map(|address| address.to_string())
+                    .collect(),
+                host_name: device.host_name.clone(),
+                port: Some(device.port),
+                is_online: device.is_online,
+                is_active: active_device_ids.iter().any(|id| id == &device.device_id),
             })
             .collect::<Vec<_>>();
 
@@ -1249,14 +1242,15 @@ impl RelayRuntime {
                 continue;
             }
 
-            let Some(socket_addr) = preferred_socket_addr(&online.addresses, online.port) else {
+            let socket_addrs = preferred_socket_addrs(&online.addresses, online.port);
+            if socket_addrs.is_empty() {
                 continue;
-            };
+            }
 
             targets.push(ActiveTarget {
                 device_id: active_device_id,
                 fingerprint: online.fingerprint.clone(),
-                socket_addr,
+                socket_addrs,
             });
         }
 
@@ -1299,6 +1293,32 @@ impl RelayRuntime {
             .unwrap_or_default()
     }
 
+    fn active_target_for(&self, device_id: &str) -> Result<ActiveTarget> {
+        let presence = self
+            .inner
+            .presence
+            .read()
+            .map_err(|_| anyhow!("presence lock poisoned"))?;
+        let Some(device) = presence.get(device_id) else {
+            bail!("unknown device");
+        };
+        if !device.is_online {
+            bail!("device is offline");
+        }
+
+        Ok(ActiveTarget {
+            device_id: device.device_id.clone(),
+            fingerprint: device.fingerprint.clone(),
+            socket_addrs: {
+                let socket_addrs = preferred_socket_addrs(&device.addresses, device.port);
+                if socket_addrs.is_empty() {
+                    bail!("the paired device has no routable address");
+                }
+                socket_addrs
+            },
+        })
+    }
+
     fn set_device_paired_state(&self, device_id: &str, paired: bool) {
         if let Ok(mut active_device_ids) = self.inner.active_device_ids.write() {
             if paired {
@@ -1309,6 +1329,95 @@ impl RelayRuntime {
                 active_device_ids.retain(|entry| entry != device_id);
             }
         }
+    }
+
+    fn set_auto_pair_blocked(&self, device_id: &str, blocked: bool) {
+        if let Ok(mut blocked_ids) = self.inner.auto_pair_blocked_device_ids.lock() {
+            if blocked {
+                blocked_ids.insert(device_id.to_string());
+            } else {
+                blocked_ids.remove(device_id);
+            }
+        }
+    }
+
+    fn is_auto_pair_blocked(&self, device_id: &str) -> bool {
+        self.inner
+            .auto_pair_blocked_device_ids
+            .lock()
+            .map(|blocked_ids| blocked_ids.contains(device_id))
+            .unwrap_or(false)
+    }
+
+    fn spawn_device_pairing_sync(&self, target: ActiveTarget, device_id: String, paired: bool) {
+        let runtime = self.clone();
+        let local_device_id = self.local_device().device_id;
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = transport::send_device_pairing_update(
+                &target.socket_addrs,
+                &target.fingerprint,
+                transport::DevicePairingUpdate {
+                    origin_device_id: local_device_id,
+                    target_device_id: device_id,
+                    paired,
+                },
+            )
+            .await
+            {
+                if transport::is_expected_disconnect_error(&error) {
+                    log::debug!(
+                        "peer does not support device pairing sync yet or closed the connection: {error}"
+                    );
+                    return;
+                }
+                log::warn!("failed to sync device pairing to peer: {error}");
+                runtime.refresh_sync_summary();
+                runtime.emit_devices_updated();
+                runtime.emit_sync_status_changed();
+            }
+        });
+    }
+
+    fn maybe_auto_pair_discovered_device(&self, peer: &DiscoveredPeer) {
+        if self
+            .active_device_ids_clone()
+            .iter()
+            .any(|device_id| device_id == &peer.device_id)
+        {
+            return;
+        }
+        if !self.active_device_ids_clone().is_empty() {
+            return;
+        }
+        if self.is_auto_pair_blocked(&peer.device_id) {
+            return;
+        }
+
+        let online_peer_count = self
+            .inner
+            .presence
+            .read()
+            .map(|presence| presence.values().filter(|device| device.is_online).count())
+            .unwrap_or_default();
+        if online_peer_count != 1 {
+            return;
+        }
+
+        let socket_addrs = preferred_socket_addrs(&peer.addresses, peer.port);
+        if socket_addrs.is_empty() {
+            return;
+        }
+
+        self.set_device_paired_state(&peer.device_id, true);
+        self.spawn_device_pairing_sync(
+            ActiveTarget {
+                device_id: peer.device_id.clone(),
+                fingerprint: peer.fingerprint.clone(),
+                socket_addrs,
+            },
+            peer.device_id.clone(),
+            true,
+        );
     }
 
     fn is_paired_device(&self, device_id: &str) -> bool {
@@ -1500,11 +1609,11 @@ impl RelayRuntime {
     }
 
     fn find_transfer_job(&self, transfer_id: &str) -> Option<TransferJob> {
-        self.inner
-            .transfer_jobs
-            .read()
-            .ok()
-            .and_then(|jobs| jobs.iter().find(|job| job.transfer_id == transfer_id).cloned())
+        self.inner.transfer_jobs.read().ok().and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job.transfer_id == transfer_id)
+                .cloned()
+        })
     }
 
     fn upsert_transfer_job(&self, job: TransferJob, persist: bool) -> Result<()> {
@@ -1514,13 +1623,19 @@ impl RelayRuntime {
                 .transfer_jobs
                 .write()
                 .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
-            if let Some(existing) = jobs.iter_mut().find(|existing| existing.transfer_id == job.transfer_id)
+            if let Some(existing) = jobs
+                .iter_mut()
+                .find(|existing| existing.transfer_id == job.transfer_id)
             {
                 *existing = job;
             } else {
                 jobs.push(job);
             }
-            if persist { Some(jobs.clone()) } else { None }
+            if persist {
+                Some(jobs.clone())
+            } else {
+                None
+            }
         };
 
         if let Some(snapshot) = snapshot {
@@ -1547,10 +1662,13 @@ impl RelayRuntime {
                 .transfer_jobs
                 .write()
                 .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
-            let updated = jobs.iter_mut().find(|job| job.transfer_id == transfer_id).map(|job| {
-                apply(job);
-                job.clone()
-            });
+            let updated = jobs
+                .iter_mut()
+                .find(|job| job.transfer_id == transfer_id)
+                .map(|job| {
+                    apply(job);
+                    job.clone()
+                });
             let snapshot = if persist { Some(jobs.clone()) } else { None };
             (updated, snapshot)
         };
@@ -1576,7 +1694,10 @@ impl RelayRuntime {
             if let Some(staging_path) = staging_path.clone() {
                 job.staging_path = Some(staging_path);
             }
-            if matches!(stage, TransferStage::Failed | TransferStage::Canceled | TransferStage::Ready) {
+            if matches!(
+                stage,
+                TransferStage::Failed | TransferStage::Canceled | TransferStage::Ready
+            ) {
                 job.finished_at = Some(Utc::now());
             }
         })
@@ -1644,27 +1765,25 @@ fn transfer_sort_rank(job: &TransferJob) -> (u8, u8) {
     (primary, secondary)
 }
 
-fn preferred_socket_addr(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> {
-    addresses
+fn preferred_socket_addrs(addresses: &[IpAddr], port: u16) -> Vec<SocketAddr> {
+    let mut ranked = addresses
         .iter()
-        .find(|address| matches!(address, IpAddr::V4(ip) if ip.is_private()))
-        .or_else(|| {
-            addresses
-                .iter()
-                .find(|address| matches!(address, IpAddr::V4(ip) if ip.is_link_local() || *ip == Ipv4Addr::LOCALHOST))
+        .map(|address| {
+            let rank = match address {
+                IpAddr::V4(ip) if ip.is_private() => 0_u8,
+                IpAddr::V4(ip) if ip.is_link_local() || *ip == Ipv4Addr::LOCALHOST => 1,
+                IpAddr::V6(ip) if ip.is_unique_local() => 2,
+                IpAddr::V4(_) => 3,
+                IpAddr::V6(ip) if *ip == Ipv6Addr::LOCALHOST => 4,
+                IpAddr::V6(ip) if !ip.is_unicast_link_local() => 5,
+                IpAddr::V6(_) => 6,
+            };
+            (rank, SocketAddr::new(*address, port))
         })
-        .or_else(|| {
-            addresses
-                .iter()
-                .find(|address| matches!(address, IpAddr::V6(ip) if ip.is_unique_local()))
-        })
-        .or_else(|| addresses.iter().find(|address| matches!(address, IpAddr::V4(_))))
-        .or_else(|| {
-            addresses.iter().find(|address| {
-                matches!(address, IpAddr::V6(ip) if !ip.is_unicast_link_local() || *ip == Ipv6Addr::LOCALHOST)
-            })
-        })
-        .map(|address| SocketAddr::new(*address, port))
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(rank, address)| (*rank, *address));
+    ranked.dedup_by_key(|(_, address)| *address);
+    ranked.into_iter().map(|(_, address)| address).collect()
 }
 
 fn relative_path_to_native(relative_path: &str) -> PathBuf {

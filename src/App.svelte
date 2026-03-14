@@ -56,6 +56,8 @@
     entries: ClipboardHistoryEntry[]
   }
 
+  type ErrorBannerSource = 'action' | 'sync'
+
   let snapshot: AppStateSnapshot | null = null
   let transferJobs: TransferJob[] = []
   let clipboardHistory: ClipboardHistoryEntry[] = []
@@ -64,6 +66,7 @@
   let busyPairingId: string | null = null
   let settingsBusy = false
   let errorBanner: string | null = null
+  let errorBannerSource: ErrorBannerSource | null = null
   const notifiedReady = new Set<string>()
 
   $: currentLanguage =
@@ -79,6 +82,24 @@
   $: visibleTransferJobs = transferJobs
   $: syncStatus = snapshot?.syncStatus
   $: historyGroups = groupHistory(clipboardHistory, localDevice?.deviceId ?? '', localDevice?.deviceName ?? copy.thisDevice)
+  $: if (errorBannerSource === 'sync' && syncStatus?.state && syncStatus.state !== 'error') {
+    clearErrorBanner()
+  }
+
+  function clearErrorBanner() {
+    errorBanner = null
+    errorBannerSource = null
+  }
+
+  function showActionError(error: unknown) {
+    errorBanner = error instanceof Error ? error.message : String(error)
+    errorBannerSource = 'action'
+  }
+
+  function showSyncError(message: string) {
+    errorBanner = message
+    errorBannerSource = 'sync'
+  }
 
   async function refresh() {
     const [state, jobs, history] = await Promise.all([
@@ -101,19 +122,19 @@
         snapshot = await updateSettings({ launchOnLogin: true })
       }
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     }
   }
 
   async function patchSettings(patch: Parameters<typeof updateSettings>[0]) {
     if (!snapshot) return
     settingsBusy = true
-    errorBanner = null
+    clearErrorBanner()
 
     try {
       snapshot = await updateSettings(patch)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     } finally {
       settingsBusy = false
     }
@@ -121,32 +142,32 @@
 
   async function updatePairing(deviceId: string, paired: boolean) {
     busyPairingId = deviceId
-    errorBanner = null
+    clearErrorBanner()
     try {
       snapshot = await setDevicePairing(deviceId, paired)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     } finally {
       busyPairingId = null
     }
   }
 
   async function toggleClipboardSync(enabled: boolean) {
-    errorBanner = null
+    clearErrorBanner()
     try {
       snapshot = await toggleSync(enabled)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     }
   }
 
   async function placeTransfer(job: TransferJob) {
     busyTransferId = job.transferId
-    errorBanner = null
+    clearErrorBanner()
     try {
       await placeReceivedTransferOnClipboard(job.transferId)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     } finally {
       busyTransferId = null
     }
@@ -154,11 +175,11 @@
 
   async function dismissTransfer(job: TransferJob) {
     busyTransferId = job.transferId
-    errorBanner = null
+    clearErrorBanner()
     try {
       await dismissTransferJob(job.transferId)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     } finally {
       busyTransferId = null
     }
@@ -166,11 +187,11 @@
 
   async function cancelTransfer(job: TransferJob) {
     busyTransferId = job.transferId
-    errorBanner = null
+    clearErrorBanner()
     try {
       await cancelTransferJob(job.transferId)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     } finally {
       busyTransferId = null
     }
@@ -178,22 +199,22 @@
 
   async function restoreHistory(entry: ClipboardHistoryEntry) {
     busyHistoryId = entry.entryId
-    errorBanner = null
+    clearErrorBanner()
     try {
       await restoreClipboardHistoryEntry(entry.entryId)
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     } finally {
       busyHistoryId = null
     }
   }
 
   async function openCache() {
-    errorBanner = null
+    clearErrorBanner()
     try {
       await openCacheDirectory()
     } catch (error) {
-      errorBanner = error instanceof Error ? error.message : String(error)
+      showActionError(error)
     }
   }
 
@@ -328,7 +349,7 @@
         snapshot = { ...snapshot, syncStatus: status }
       }),
       onClipboardError((message) => {
-        if (!disposed) errorBanner = message
+        if (!disposed) showSyncError(message)
       }),
       onClipboardHistoryUpdated((entries) => {
         if (!disposed) clipboardHistory = entries

@@ -32,7 +32,7 @@ It is built with:
 
 - Text
 - PNG image clipboard payloads
-- File and folder references
+*- File and folder reference*s
 
 Out of scope for the current version:
 

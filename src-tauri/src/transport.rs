@@ -12,6 +12,7 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -127,8 +128,14 @@ pub async fn start_server(
             let acceptor = acceptor.clone();
             let runtime = relay.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = accept_connection(runtime.clone(), acceptor, stream).await {
-                    runtime.emit_clipboard_error(format!("Inbound sync failed: {error}"));
+                match accept_connection(runtime.clone(), acceptor, stream).await {
+                    Ok(()) => {}
+                    Err(error) if is_expected_disconnect(&error) => {
+                        log::debug!("inbound relay connection closed: {error}");
+                    }
+                    Err(error) => {
+                        runtime.emit_clipboard_error(format!("Inbound sync failed: {error}"));
+                    }
                 }
             });
         }
@@ -138,25 +145,11 @@ pub async fn start_server(
 }
 
 pub async fn send_envelope(
-    address: std::net::SocketAddr,
+    addresses: &[SocketAddr],
     expected_fingerprint: &str,
     envelope: ClipboardEnvelope,
 ) -> Result<()> {
-    let connector = TlsConnector::from(Arc::new(build_client_config()));
-    let stream = TcpStream::connect(address)
-        .await
-        .with_context(|| format!("failed to connect to {address}"))?;
-    let server_name =
-        ServerName::try_from("relayclip.local").map_err(|_| anyhow!("invalid tls server name"))?;
-    let mut tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .context("failed to complete the tls handshake")?;
-
-    let fingerprint = peer_fingerprint(&tls_stream)?;
-    if fingerprint != expected_fingerprint {
-        bail!("peer fingerprint mismatch");
-    }
+    let mut tls_stream = connect_verified_tls(addresses, expected_fingerprint).await?;
 
     write_channel(&mut tls_stream, CHANNEL_CLIPBOARD).await?;
     write_envelope(&mut tls_stream, &envelope).await?;
@@ -166,27 +159,13 @@ pub async fn send_envelope(
 
 pub async fn send_transfer(
     runtime: RelayRuntime,
-    address: std::net::SocketAddr,
+    addresses: &[SocketAddr],
     expected_fingerprint: &str,
     offer: IncomingTransferOffer,
     prepared: PreparedTransfer,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<()> {
-    let connector = TlsConnector::from(Arc::new(build_client_config()));
-    let stream = TcpStream::connect(address)
-        .await
-        .with_context(|| format!("failed to connect to {address}"))?;
-    let server_name =
-        ServerName::try_from("relayclip.local").map_err(|_| anyhow!("invalid tls server name"))?;
-    let mut tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .context("failed to complete the tls handshake")?;
-
-    let fingerprint = peer_fingerprint(&tls_stream)?;
-    if fingerprint != expected_fingerprint {
-        bail!("peer fingerprint mismatch");
-    }
+    let mut tls_stream = connect_verified_tls(addresses, expected_fingerprint).await?;
 
     write_channel(&mut tls_stream, CHANNEL_TRANSFER).await?;
     write_transfer_json(&mut tls_stream, TRANSFER_FRAME_OFFER, &offer).await?;
@@ -197,7 +176,9 @@ pub async fn send_transfer(
             if !decision.accepted {
                 bail!(
                     "{}",
-                    decision.reason.unwrap_or_else(|| "transfer was rejected".to_string())
+                    decision
+                        .reason
+                        .unwrap_or_else(|| "transfer was rejected".to_string())
                 );
             }
         }
@@ -205,7 +186,9 @@ pub async fn send_transfer(
             let decision: TransferDecision = serde_json::from_slice(&frame_payload)?;
             bail!(
                 "{}",
-                decision.reason.unwrap_or_else(|| "transfer was rejected".to_string())
+                decision
+                    .reason
+                    .unwrap_or_else(|| "transfer was rejected".to_string())
             );
         }
         _ => bail!("unexpected transfer response frame"),
@@ -225,8 +208,14 @@ pub async fn send_transfer(
             .ok();
             bail!("transfer canceled");
         }
-        send_file_entry(&runtime, &offer.transfer_id, &mut tls_stream, entry, cancel_flag.clone())
-            .await?;
+        send_file_entry(
+            &runtime,
+            &offer.transfer_id,
+            &mut tls_stream,
+            entry,
+            cancel_flag.clone(),
+        )
+        .await?;
     }
 
     write_transfer_json(
@@ -255,25 +244,11 @@ pub async fn send_transfer(
 }
 
 pub async fn send_device_pairing_update(
-    address: std::net::SocketAddr,
+    addresses: &[SocketAddr],
     expected_fingerprint: &str,
     update: DevicePairingUpdate,
 ) -> Result<()> {
-    let connector = TlsConnector::from(Arc::new(build_client_config()));
-    let stream = TcpStream::connect(address)
-        .await
-        .with_context(|| format!("failed to connect to {address}"))?;
-    let server_name =
-        ServerName::try_from("relayclip.local").map_err(|_| anyhow!("invalid tls server name"))?;
-    let mut tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .context("failed to complete the tls handshake")?;
-
-    let fingerprint = peer_fingerprint(&tls_stream)?;
-    if fingerprint != expected_fingerprint {
-        bail!("peer fingerprint mismatch");
-    }
+    let mut tls_stream = connect_verified_tls(addresses, expected_fingerprint).await?;
 
     write_channel(&mut tls_stream, CHANNEL_CONTROL).await?;
     write_control_json(&mut tls_stream, CONTROL_FRAME_SET_DEVICE_PAIRING, &update).await?;
@@ -292,6 +267,46 @@ pub async fn send_device_pairing_update(
         }
         _ => bail!("unexpected control response frame"),
     }
+}
+
+async fn connect_verified_tls(
+    addresses: &[SocketAddr],
+    expected_fingerprint: &str,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    if addresses.is_empty() {
+        bail!("peer has no routable address");
+    }
+
+    let connector = TlsConnector::from(Arc::new(build_client_config()));
+    let server_name =
+        ServerName::try_from("relayclip.local").map_err(|_| anyhow!("invalid tls server name"))?;
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for address in addresses {
+        let stream = match TcpStream::connect(*address).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = Some(anyhow!("failed to connect to {address}: {error}"));
+                continue;
+            }
+        };
+        let tls_stream = match connector.connect(server_name.clone(), stream).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = Some(anyhow!("failed to complete the tls handshake: {error}"));
+                continue;
+            }
+        };
+
+        let fingerprint = peer_fingerprint(&tls_stream)?;
+        if fingerprint != expected_fingerprint {
+            bail!("peer fingerprint mismatch");
+        }
+
+        return Ok(tls_stream);
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to connect to the peer")))
 }
 
 pub fn fingerprint_from_bytes(bytes: &[u8]) -> String {
@@ -349,18 +364,28 @@ async fn accept_connection(
     stream: TcpStream,
 ) -> Result<()> {
     let mut tls_stream = acceptor.accept(stream).await.context("tls accept failed")?;
-    match read_channel(&mut tls_stream).await? {
-        CHANNEL_CLIPBOARD => loop {
-            match read_envelope(&mut tls_stream).await? {
-                Some(envelope) => runtime.handle_incoming_envelope(envelope).await?,
-                None => break,
+    let result: Result<()> = match read_channel(&mut tls_stream).await? {
+        CHANNEL_CLIPBOARD => {
+            loop {
+                match read_envelope(&mut tls_stream).await? {
+                    Some(envelope) => runtime.handle_incoming_envelope(envelope).await?,
+                    None => break,
+                }
             }
-        },
-        CHANNEL_TRANSFER => accept_transfer(runtime, &mut tls_stream).await?,
-        CHANNEL_CONTROL => accept_control(runtime, &mut tls_stream).await?,
+            Ok(())
+        }
+        CHANNEL_TRANSFER => accept_transfer(runtime, &mut tls_stream).await,
+        CHANNEL_CONTROL => accept_control(runtime, &mut tls_stream).await,
         _ => bail!("unsupported relay channel"),
+    };
+
+    if let Err(error) = tls_stream.shutdown().await {
+        if result.is_ok() && !is_disconnect_io_error(&error) {
+            return Err(error.into());
+        }
     }
-    Ok(())
+
+    result
 }
 
 async fn accept_control(
@@ -399,7 +424,8 @@ async fn accept_control(
                     )
                     .await
                     .ok();
-                    Err(error)
+                    log::warn!("rejected remote device pairing update: {error}");
+                    Ok(())
                 }
             }
         }
@@ -430,7 +456,11 @@ async fn accept_transfer(
             )
             .await
             .ok();
-            return Err(error);
+            log::warn!(
+                "rejected incoming transfer offer {}: {error}",
+                offer.transfer_id
+            );
+            return Ok(());
         }
     };
 
@@ -444,9 +474,29 @@ async fn accept_transfer(
     )
     .await?;
 
-    let result = receive_transfer_payload(runtime.clone(), &offer, &prep.staging_root, stream).await;
+    let result =
+        receive_transfer_payload(runtime.clone(), &offer, &prep.staging_root, stream).await;
     drop(prep.lease);
-    result
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_transfer_canceled(&error) => Ok(()),
+        Err(error) if is_expected_disconnect(&error) => {
+            runtime.fail_transfer(
+                &offer.transfer_id,
+                "peer disconnected before the transfer finished",
+            )?;
+            log::warn!(
+                "incoming transfer {} interrupted by peer disconnect: {error}",
+                offer.transfer_id
+            );
+            Ok(())
+        }
+        Err(error) => {
+            runtime.fail_transfer(&offer.transfer_id, error.to_string())?;
+            Err(error)
+        }
+    }
 }
 
 async fn receive_transfer_payload(
@@ -490,7 +540,7 @@ async fn receive_transfer_payload(
             }
             TRANSFER_FRAME_COMPLETE => {
                 runtime.complete_incoming_transfer(&offer.transfer_id)?;
-                write_transfer_json(
+                if let Err(error) = write_transfer_json(
                     stream,
                     TRANSFER_FRAME_ACK,
                     &TransferDecision {
@@ -498,7 +548,12 @@ async fn receive_transfer_payload(
                         reason: None,
                     },
                 )
-                .await?;
+                .await
+                {
+                    if !is_expected_disconnect(&error) {
+                        return Err(error);
+                    }
+                }
                 return Ok(());
             }
             TRANSFER_FRAME_CANCEL => {
@@ -513,7 +568,7 @@ async fn receive_transfer_payload(
                 )
                 .await
                 .ok();
-                bail!("transfer canceled");
+                return Ok(());
             }
             _ => bail!("unexpected transfer frame"),
         }
@@ -591,7 +646,7 @@ where
     let mut len_buf = [0_u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) if is_disconnect_io_error(&error) => return Ok(None),
         Err(error) => return Err(error.into()),
     }
 
@@ -728,6 +783,43 @@ fn native_relative_path(relative_path: &str) -> PathBuf {
     relative_path
         .split('/')
         .fold(PathBuf::new(), |path, segment| path.join(segment))
+}
+
+fn is_disconnect_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+fn is_expected_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(is_disconnect_io_error)
+            || cause
+                .downcast_ref::<RustlsError>()
+                .is_some_and(|tls_error| {
+                    tls_error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("close notify")
+                })
+    })
+}
+
+pub(crate) fn is_expected_disconnect_error(error: &anyhow::Error) -> bool {
+    is_expected_disconnect(error)
+}
+
+fn is_transfer_canceled(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().eq_ignore_ascii_case("transfer canceled"))
 }
 
 #[derive(Debug)]

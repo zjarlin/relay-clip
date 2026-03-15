@@ -285,6 +285,9 @@ jobs:
           APPLE_DEVELOPMENT_TEAM: TEAMID0000
         run: pnpm tauri ios init --ci --skip-targets-install
 
+      - name: Patch iOS project
+        run: node scripts/configure-apple-project.mjs
+
       - name: Build unsigned iOS app
         shell: bash
         run: |

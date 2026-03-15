@@ -280,6 +280,39 @@ jobs:
       - name: Apply calendar version
         run: pnpm version:calver
 
+      - name: Prepare iOS CI config
+        shell: bash
+        run: |
+          node <<'EOF'
+          const fs = require('node:fs')
+
+          const basePath = 'src-tauri/tauri.conf.json'
+          const iosPath = 'src-tauri/tauri.ios.conf.json'
+          const base = JSON.parse(fs.readFileSync(basePath, 'utf8'))
+          const ios = JSON.parse(fs.readFileSync(iosPath, 'utf8'))
+
+          const merged = {
+            ...base,
+            ...ios,
+            build: {
+              ...base.build,
+            },
+            bundle: {
+              ...(base.bundle ?? {}),
+              ...(ios.bundle ?? {}),
+              iOS: {
+                ...(base.bundle?.iOS ?? {}),
+                ...(ios.bundle?.iOS ?? {}),
+              },
+            },
+          }
+
+          delete merged.build.devUrl
+          delete merged.build.beforeDevCommand
+
+          fs.writeFileSync(basePath, `${JSON.stringify(merged, null, 2)}\n`)
+          EOF
+
       - name: Initialize iOS project
         env:
           APPLE_DEVELOPMENT_TEAM: TEAMID0000

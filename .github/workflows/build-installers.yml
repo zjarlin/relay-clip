@@ -153,6 +153,49 @@ jobs:
           keyPassword=${ANDROID_KEY_PASSWORD}
           EOF
 
+      - name: Generate ephemeral Android signing key
+        if: ${{ env.ANDROID_KEYSTORE_BASE64 == '' || env.ANDROID_KEYSTORE_PASSWORD == '' || env.ANDROID_KEY_ALIAS == '' || env.ANDROID_KEY_PASSWORD == '' }}
+        shell: bash
+        run: |
+          mkdir -p src-tauri/gen/android
+
+          STORE_PASSWORD="$(openssl rand -hex 16)"
+          KEY_ALIAS="relayclip-ephemeral"
+          KEY_PASSWORD="$STORE_PASSWORD"
+
+          keytool -genkeypair \
+            -alias "$KEY_ALIAS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -storetype PKCS12 \
+            -keystore src-tauri/gen/android/relayclip-ephemeral-keystore.jks \
+            -storepass "$STORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -dname "CN=RelayClip Ephemeral CI, OU=CI, O=RelayClip, L=Internet, ST=Internet, C=US"
+
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          passwordFormatVersion=1
+          storeFile=relayclip-ephemeral-keystore.jks
+          storePassword=${STORE_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PASSWORD}
+          EOF
+
+      - name: Add Android signing note
+        shell: bash
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            cat > ANDROID-SIGNING.txt <<'EOF'
+          Android APKs in this build are signed with the configured release keystore.
+          EOF
+          else
+            cat > ANDROID-SIGNING.txt <<'EOF'
+          Android APKs in this build are signed with a temporary CI-generated release keystore.
+          These APKs are installable on regular Android devices, but future builds signed with a different key will not install as upgrades.
+          EOF
+          fi
+
       - name: Build Android artifacts
         run: pnpm tauri android build --ci --apk --aab --split-per-abi
 
@@ -168,11 +211,12 @@ jobs:
         with:
           name: relayclip-android-packages
           path: |
+            ANDROID-SIGNING.txt
             src-tauri/gen/android/app/build/outputs/**/*.apk
           if-no-files-found: error
 
       - name: Publish Android internal testing release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') && steps.android_bundle.outputs.path != '' && env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && steps.android_bundle.outputs.path != '' && env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' && env.ANDROID_KEYSTORE_BASE64 != '' && env.ANDROID_KEYSTORE_PASSWORD != '' && env.ANDROID_KEY_ALIAS != '' && env.ANDROID_KEY_PASSWORD != '' }}
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
@@ -181,22 +225,12 @@ jobs:
           track: internal
 
   build_ios:
-    name: iOS Archive
+    name: iOS Unsigned Build
     runs-on: macos-latest
-    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Detect iOS signing mode
-        shell: bash
-        run: |
-          if [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER" ] && [ -n "$APPLE_API_PRIVATE_KEY" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
-            echo "Using signed iOS archive mode"
-          else
-            echo "Apple signing secrets are missing; falling back to iOS project archive mode"
-          fi
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -246,82 +280,53 @@ jobs:
       - name: Apply calendar version
         run: pnpm version:calver
 
-      - name: Configure App Store Connect key
-        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
-        shell: bash
-        run: |
-          mkdir -p "$HOME/private_keys"
-          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$HOME/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
-
       - name: Initialize iOS project
-        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
-        run: pnpm tauri ios init --ci --skip-targets-install
-
-      - name: Build signed iOS archive
-        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
-        env:
-          APPLE_API_KEY: ${{ env.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ env.APPLE_API_ISSUER }}
-          APPLE_DEVELOPMENT_TEAM: ${{ env.APPLE_DEVELOPMENT_TEAM }}
-        run: pnpm tauri ios build --ci --export-method app-store-connect --build-number $RELAYCLIP_BUILD_NUMBER
-
-      - name: Locate IPA
-        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
-        id: ios_ipa
-        shell: bash
-        run: |
-          IPA_PATH=$(find src-tauri/gen/apple/build -name '*.ipa' -print -quit)
-          echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
-
-      - name: Upload iOS artifact
-        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && env.APPLE_API_PRIVATE_KEY != '' && env.APPLE_DEVELOPMENT_TEAM != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: relayclip-ios-archive
-          path: src-tauri/gen/apple/build/**/*.ipa
-          if-no-files-found: error
-
-      - name: Initialize unsigned iOS project
-        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
         env:
           APPLE_DEVELOPMENT_TEAM: TEAMID0000
         run: pnpm tauri ios init --ci --skip-targets-install
 
-      - name: Add unsigned iOS archive note
-        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+      - name: Build unsigned iOS app
         shell: bash
         run: |
-          cat > src-tauri/gen/apple/README-CODE-SIGNING.txt <<'EOF'
-          This archive contains an unsigned iOS Xcode project generated without Apple signing secrets.
-          Replace the placeholder development team ID TEAMID0000 with your real Apple Developer Team ID
-          before building or archiving the app in Xcode.
+          xcodebuild \
+            -project src-tauri/gen/apple/relayclip.xcodeproj \
+            -scheme relayclip_iOS \
+            -configuration release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath src-tauri/gen/apple/build/unsigned \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            clean build
+
+      - name: Add unsigned iOS build note
+        shell: bash
+        run: |
+          cat > README-IOS-UNSIGNED.txt <<'EOF'
+          This archive contains an unsigned iOS .app bundle built in CI with code signing disabled.
+          It is useful for build verification, but it cannot be installed on devices until you sign it yourself.
           EOF
 
-      - name: Package iOS project archive
-        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+      - name: Package unsigned iOS app
         shell: bash
         run: |
-          rm -f relayclip-ios-project.zip
-          cd src-tauri/gen
-          zip -r ../../relayclip-ios-project.zip apple
+          APP_PATH=$(find src-tauri/gen/apple/build/unsigned/Build/Products -type d -name '*.app' -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo "Unsigned iOS app not found"
+            exit 1
+          fi
 
-      - name: Upload iOS project artifact
-        if: ${{ env.APPLE_API_KEY_ID == '' || env.APPLE_API_ISSUER == '' || env.APPLE_API_PRIVATE_KEY == '' || env.APPLE_DEVELOPMENT_TEAM == '' }}
+          rm -rf relayclip-ios-unsigned-app relayclip-ios-unsigned-app.zip
+          mkdir -p relayclip-ios-unsigned-app
+          cp README-IOS-UNSIGNED.txt relayclip-ios-unsigned-app/
+          ditto "$APP_PATH" "relayclip-ios-unsigned-app/$(basename "$APP_PATH")"
+          ditto -c -k --sequesterRsrc --keepParent relayclip-ios-unsigned-app relayclip-ios-unsigned-app.zip
+
+      - name: Upload unsigned iOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: relayclip-ios-project
-          path: relayclip-ios-project.zip
+          name: relayclip-ios-unsigned-app
+          path: relayclip-ios-unsigned-app.zip
           if-no-files-found: error
-
-      - name: Upload to TestFlight
-        if: ${{ env.APPLE_API_KEY_ID != '' && env.APPLE_API_ISSUER != '' && steps.ios_ipa.outputs.path != '' }}
-        shell: bash
-        run: |
-          xcrun altool --upload-app \
-            --type ios \
-            --file "${{ steps.ios_ipa.outputs.path }}" \
-            --apiKey "$APPLE_API_KEY_ID" \
-            --apiIssuer "$APPLE_API_ISSUER"
 
   release:
     name: Publish Release Assets
@@ -346,5 +351,4 @@ jobs:
             release-assets/relayclip-windows-installer/*.exe
             release-assets/relayclip-macos-installer/*.dmg
             release-assets/relayclip-android-packages/**/*.apk
-            release-assets/relayclip-ios-archive/**/*.ipa
-            release-assets/relayclip-ios-project/**/*.zip
+            release-assets/relayclip-ios-unsigned-app/**/*.zip

@@ -143,8 +143,8 @@ jobs:
         if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' && env.ANDROID_KEYSTORE_PASSWORD != '' && env.ANDROID_KEY_ALIAS != '' && env.ANDROID_KEY_PASSWORD != '' }}
         shell: bash
         run: |
-          mkdir -p src-tauri/gen/android
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > src-tauri/gen/android/relayclip-upload-keystore.jks
+          mkdir -p src-tauri/gen/android src-tauri/gen/android/app
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > src-tauri/gen/android/app/relayclip-upload-keystore.jks
           cat > src-tauri/gen/android/keystore.properties <<EOF
           passwordFormatVersion=1
           storeFile=relayclip-upload-keystore.jks
@@ -157,7 +157,7 @@ jobs:
         if: ${{ env.ANDROID_KEYSTORE_BASE64 == '' || env.ANDROID_KEYSTORE_PASSWORD == '' || env.ANDROID_KEY_ALIAS == '' || env.ANDROID_KEY_PASSWORD == '' }}
         shell: bash
         run: |
-          mkdir -p src-tauri/gen/android
+          mkdir -p src-tauri/gen/android src-tauri/gen/android/app
 
           STORE_PASSWORD="$(openssl rand -hex 16)"
           KEY_ALIAS="relayclip-ephemeral"
@@ -169,7 +169,7 @@ jobs:
             -keysize 2048 \
             -validity 3650 \
             -storetype PKCS12 \
-            -keystore src-tauri/gen/android/relayclip-ephemeral-keystore.jks \
+            -keystore src-tauri/gen/android/app/relayclip-ephemeral-keystore.jks \
             -storepass "$STORE_PASSWORD" \
             -keypass "$KEY_PASSWORD" \
             -dname "CN=RelayClip Ephemeral CI, OU=CI, O=RelayClip, L=Internet, ST=Internet, C=US"

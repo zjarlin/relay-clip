@@ -375,15 +375,9 @@ impl RelayRuntime {
         );
 
         for target in targets {
-            let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst);
-            let envelope = transport::envelope_from_packet(
-                local_device.device_id.clone(),
-                target.device_id.clone(),
-                &packet,
-                sequence,
-            );
-
-            match transport::send_envelope(target.socket_addr, &target.fingerprint, envelope).await
+            match self
+                .send_clipboard_packet_to_target(&local_device, &target, &packet)
+                .await
             {
                 Ok(_) => self.record_device_sync(
                     &target.device_id,
@@ -627,7 +621,6 @@ impl RelayRuntime {
                 cancel.store(true, Ordering::SeqCst);
             }
         }
-
         let _ = self.finish_transfer(transfer_id, TransferStage::Canceled, None, |job| {
             job.ready_to_paste = false;
         })?;
@@ -1068,6 +1061,23 @@ impl RelayRuntime {
             transfer_id: Some(job.transfer_id.clone()),
             top_level_names: job.top_level_names.clone(),
         })
+    }
+
+    async fn send_clipboard_packet_to_target(
+        &self,
+        local_device: &LocalDevice,
+        target: &ActiveTarget,
+        packet: &ClipboardPacket,
+    ) -> Result<()> {
+        let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst);
+        let envelope = transport::envelope_from_packet(
+            local_device.device_id.clone(),
+            target.device_id.clone(),
+            packet,
+            sequence,
+        );
+
+        transport::send_envelope(target.socket_addr, &target.fingerprint, envelope).await
     }
 
     fn restore_file_history_paths(&self, entry: &ClipboardHistoryEntry) -> Result<Vec<PathBuf>> {

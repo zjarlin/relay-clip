@@ -138,7 +138,11 @@ pub async fn start_server(
             let runtime = relay.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = accept_connection(runtime.clone(), acceptor, stream).await {
-                    runtime.emit_clipboard_error(format!("Inbound sync failed: {error}"));
+                    if is_benign_transport_error(&error) {
+                        log::debug!("ignored benign inbound transport error: {error}");
+                    } else {
+                        runtime.emit_clipboard_error(format!("Inbound sync failed: {error}"));
+                    }
                 }
             });
         }
@@ -170,6 +174,7 @@ pub async fn send_envelope(
 
     write_channel(&mut tls_stream, CHANNEL_CLIPBOARD).await?;
     write_envelope(&mut tls_stream, &envelope).await?;
+    tls_stream.get_mut().1.send_close_notify();
     tls_stream.shutdown().await.ok();
     Ok(())
 }
@@ -260,7 +265,11 @@ pub async fn send_transfer(
     .await?;
     let (frame_type, payload) = read_transfer_frame(&mut tls_stream).await?;
     match frame_type {
-        TRANSFER_FRAME_ACK => Ok(()),
+        TRANSFER_FRAME_ACK => {
+            tls_stream.get_mut().1.send_close_notify();
+            tls_stream.shutdown().await.ok();
+            Ok(())
+        }
         TRANSFER_FRAME_REJECT | TRANSFER_FRAME_CANCEL => {
             let decision: TransferDecision = serde_json::from_slice(&payload)?;
             bail!(
@@ -300,7 +309,11 @@ pub async fn send_device_pairing_update(
 
     let (frame_type, payload) = read_control_frame(&mut tls_stream).await?;
     match frame_type {
-        CONTROL_FRAME_ACK => Ok(()),
+        CONTROL_FRAME_ACK => {
+            tls_stream.get_mut().1.send_close_notify();
+            tls_stream.shutdown().await.ok();
+            Ok(())
+        }
         CONTROL_FRAME_REJECT => {
             let decision: TransferDecision = serde_json::from_slice(&payload)?;
             bail!(
@@ -746,6 +759,37 @@ fn native_relative_path(relative_path: &str) -> PathBuf {
     relative_path
         .split('/')
         .fold(PathBuf::new(), |path, segment| path.join(segment))
+}
+
+fn is_benign_transport_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::NotConnected
+                )
+            })
+    }) {
+        return true;
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "connection reset by peer",
+        "peer closed connection without sending tls close_notify",
+        "unexpected eof",
+        "broken pipe",
+        "connection aborted",
+        "connection reset",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 #[derive(Debug)]

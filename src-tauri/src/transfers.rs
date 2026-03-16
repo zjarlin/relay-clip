@@ -112,7 +112,13 @@ pub fn prepare_transfer(paths: &[PathBuf]) -> Result<PreparedTransfer> {
         top_level_names.push(top_name);
 
         if metadata.is_dir() {
-            collect_directory(path, &relative_root, &mut entries, &mut total_bytes, &mut skipped)?;
+            collect_directory(
+                path,
+                &relative_root,
+                &mut entries,
+                &mut total_bytes,
+                &mut skipped,
+            )?;
         } else if metadata.is_file() {
             entries.push(PreparedTransferEntry {
                 entry: TransferEntry {
@@ -138,7 +144,9 @@ pub fn prepare_transfer(paths: &[PathBuf]) -> Result<PreparedTransfer> {
     };
 
     let warning_message = if skipped > 0 {
-        Some(format!("{skipped} item(s) were skipped because they are links or unsupported"))
+        Some(format!(
+            "{skipped} item(s) were skipped because they are links or unsupported"
+        ))
     } else {
         None
     };

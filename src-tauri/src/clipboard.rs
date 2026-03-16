@@ -106,8 +106,8 @@ mod desktop {
         let mut clipboard = Clipboard::new().context("failed to access system clipboard")?;
         match packet.meta.kind {
             crate::models::ClipboardPayloadKind::Text => {
-                let text =
-                    String::from_utf8(packet.bytes.clone()).context("clipboard text was not utf-8")?;
+                let text = String::from_utf8(packet.bytes.clone())
+                    .context("clipboard text was not utf-8")?;
                 clipboard
                     .set_text(text)
                     .context("failed to write text to clipboard")?;

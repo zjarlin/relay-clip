@@ -5,8 +5,8 @@ mod mobile_bridge;
 mod models;
 mod runtime;
 mod store;
-mod transport;
 mod transfers;
+mod transport;
 mod tray;
 
 use crate::models::{
@@ -32,20 +32,23 @@ fn get_app_state(runtime: State<'_, RelayRuntime>) -> Result<AppStateSnapshot, S
 }
 
 #[tauri::command]
-fn get_runtime_capabilities(runtime: State<'_, RelayRuntime>) -> Result<RuntimeCapabilities, String>
-{
+fn get_runtime_capabilities(
+    runtime: State<'_, RelayRuntime>,
+) -> Result<RuntimeCapabilities, String> {
     Ok(runtime.runtime_capabilities())
 }
 
 #[tauri::command]
-fn request_runtime_permissions(runtime: State<'_, RelayRuntime>) -> Result<RuntimePermissions, String>
-{
+fn request_runtime_permissions(
+    runtime: State<'_, RelayRuntime>,
+) -> Result<RuntimePermissions, String> {
     Ok(runtime.request_runtime_permissions())
 }
 
 #[tauri::command]
-fn get_background_sync_state(runtime: State<'_, RelayRuntime>) -> Result<BackgroundSyncState, String>
-{
+fn get_background_sync_state(
+    runtime: State<'_, RelayRuntime>,
+) -> Result<BackgroundSyncState, String> {
     Ok(runtime.background_sync_state())
 }
 
@@ -134,7 +137,9 @@ fn dismiss_transfer_job(
     runtime: State<'_, RelayRuntime>,
     transfer_id: String,
 ) -> Result<(), String> {
-    runtime.dismiss_transfer_job(transfer_id).map_err(to_error_string)
+    runtime
+        .dismiss_transfer_job(transfer_id)
+        .map_err(to_error_string)
 }
 
 #[tauri::command]
@@ -142,7 +147,9 @@ fn cancel_transfer_job(
     runtime: State<'_, RelayRuntime>,
     transfer_id: String,
 ) -> Result<(), String> {
-    runtime.cancel_transfer_job(transfer_id).map_err(to_error_string)
+    runtime
+        .cancel_transfer_job(transfer_id)
+        .map_err(to_error_string)
 }
 
 #[tauri::command]

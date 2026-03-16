@@ -33,7 +33,10 @@ pub fn no_paired_devices(language: AppLanguage) -> String {
 pub fn sending(language: AppLanguage, kind: &ClipboardPayloadKind, device_count: usize) -> String {
     match language {
         AppLanguage::ZhCn => {
-            format!("正在向 {device_count} 台设备发送{}", payload_kind(language, kind))
+            format!(
+                "正在向 {device_count} 台设备发送{}",
+                payload_kind(language, kind)
+            )
         }
         AppLanguage::En => format!(
             "Sending {} clipboard to {device_count} paired device(s)",

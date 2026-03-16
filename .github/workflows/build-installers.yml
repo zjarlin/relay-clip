@@ -7,6 +7,7 @@ on:
       - main
     tags:
       - "v*"
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]"
 
 permissions:
   contents: write
@@ -216,7 +217,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Android internal testing release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') && steps.android_bundle.outputs.path != '' && env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' && env.ANDROID_KEYSTORE_BASE64 != '' && env.ANDROID_KEYSTORE_PASSWORD != '' && env.ANDROID_KEY_ALIAS != '' && env.ANDROID_KEY_PASSWORD != '' }}
+        if: ${{ (startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/20')) && steps.android_bundle.outputs.path != '' && env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' && env.ANDROID_KEYSTORE_BASE64 != '' && env.ANDROID_KEYSTORE_PASSWORD != '' && env.ANDROID_KEY_ALIAS != '' && env.ANDROID_KEY_PASSWORD != '' }}
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
@@ -326,7 +327,7 @@ jobs:
 
   release:
     name: Publish Release Assets
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/20')
     needs:
       - build_desktop
       - build_android

@@ -1,7 +1,7 @@
 use crate::models::{
-    current_platform, default_app_language, AppSettings, ClipboardHistoryEntry,
-    CLIPBOARD_HISTORY_LIMIT, CLIPBOARD_HISTORY_RETENTION_HOURS, LocalDevice, PersistentState,
-    TransferJob, TransferStage, TRANSFER_RETENTION_HOURS, CAPABILITIES, PROTOCOL_VERSION,
+    current_platform, default_app_language, AppSettings, ClipboardHistoryEntry, LocalDevice,
+    PersistentState, TransferJob, TransferStage, CAPABILITIES, CLIPBOARD_HISTORY_LIMIT,
+    CLIPBOARD_HISTORY_RETENTION_HOURS, PROTOCOL_VERSION, TRANSFER_RETENTION_HOURS,
 };
 use crate::transport;
 use anyhow::{Context, Result};
@@ -323,7 +323,9 @@ fn prune_transfer_directories(state_path: &Path, jobs: &[TransferJob]) -> Result
         .map(PathBuf::from)
         .collect::<Vec<_>>();
 
-    for entry in fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))? {
+    for entry in
+        fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
         if !retained.iter().any(|retained_path| retained_path == &path) {
@@ -349,7 +351,9 @@ fn prune_clipboard_history_directories(
         .filter_map(|path| path.parent().map(PathBuf::from))
         .collect::<Vec<_>>();
 
-    for entry in fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))? {
+    for entry in
+        fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
         if !retained.iter().any(|retained_path| retained_path == &path) {

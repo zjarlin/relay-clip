@@ -6,9 +6,8 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{
-    Manager,
     plugin::{Builder as PluginBuilder, TauriPlugin},
-    Runtime,
+    Manager, Runtime,
 };
 
 #[derive(Clone)]

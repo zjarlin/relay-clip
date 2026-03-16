@@ -100,6 +100,16 @@ pub struct DevicePairingUpdate {
     pub origin_device_id: String,
     pub target_device_id: String,
     pub paired: bool,
+    #[serde(default)]
+    pub origin_device_name: String,
+    #[serde(default)]
+    pub origin_platform: String,
+    #[serde(default)]
+    pub origin_capabilities: Vec<String>,
+    #[serde(default)]
+    pub origin_fingerprint: String,
+    #[serde(default)]
+    pub origin_listen_port: Option<u16>,
 }
 
 pub async fn start_server(
@@ -197,7 +207,9 @@ pub async fn send_transfer(
             if !decision.accepted {
                 bail!(
                     "{}",
-                    decision.reason.unwrap_or_else(|| "transfer was rejected".to_string())
+                    decision
+                        .reason
+                        .unwrap_or_else(|| "transfer was rejected".to_string())
                 );
             }
         }
@@ -205,7 +217,9 @@ pub async fn send_transfer(
             let decision: TransferDecision = serde_json::from_slice(&frame_payload)?;
             bail!(
                 "{}",
-                decision.reason.unwrap_or_else(|| "transfer was rejected".to_string())
+                decision
+                    .reason
+                    .unwrap_or_else(|| "transfer was rejected".to_string())
             );
         }
         _ => bail!("unexpected transfer response frame"),
@@ -225,8 +239,14 @@ pub async fn send_transfer(
             .ok();
             bail!("transfer canceled");
         }
-        send_file_entry(&runtime, &offer.transfer_id, &mut tls_stream, entry, cancel_flag.clone())
-            .await?;
+        send_file_entry(
+            &runtime,
+            &offer.transfer_id,
+            &mut tls_stream,
+            entry,
+            cancel_flag.clone(),
+        )
+        .await?;
     }
 
     write_transfer_json(
@@ -371,11 +391,8 @@ async fn accept_control(
     match frame_type {
         CONTROL_FRAME_SET_DEVICE_PAIRING => {
             let update: DevicePairingUpdate = serde_json::from_slice(&payload)?;
-            match runtime.accept_remote_device_pairing_update(
-                &update.origin_device_id,
-                &update.target_device_id,
-                update.paired,
-            ) {
+            let peer_addr = stream.get_ref().0.peer_addr().ok();
+            match runtime.accept_remote_device_pairing_update(&update, peer_addr) {
                 Ok(_) => {
                     write_control_json(
                         stream,
@@ -444,7 +461,8 @@ async fn accept_transfer(
     )
     .await?;
 
-    let result = receive_transfer_payload(runtime.clone(), &offer, &prep.staging_root, stream).await;
+    let result =
+        receive_transfer_payload(runtime.clone(), &offer, &prep.staging_root, stream).await;
     drop(prep.lease);
     result
 }

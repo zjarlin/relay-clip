@@ -10,9 +10,9 @@ use crate::models::{
     TransferJob, TransferKind, TransferStage, TrustedDevice,
 };
 use crate::store;
+use crate::transfers::{self, LocalFileClipboard};
 use crate::transport::{self, ClipboardEnvelope, IncomingTransferOffer};
 use crate::tray;
-use crate::transfers::{self, LocalFileClipboard};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
@@ -242,50 +242,14 @@ impl RelayRuntime {
         if device_id == local_device_id {
             bail!("cannot pair this device with itself");
         }
-        let presence = self
-            .inner
-            .presence
-            .read()
-            .map_err(|_| anyhow!("presence lock poisoned"))?;
-        let Some(device) = presence.get(&device_id) else {
-            bail!("unknown device");
-        };
-        if !device.is_online {
-            bail!("device is offline");
-        }
-        let target = ActiveTarget {
-            device_id: device.device_id.clone(),
-            fingerprint: device.fingerprint.clone(),
-            socket_addr: preferred_socket_addr(&device.addresses, device.port)
-                .ok_or_else(|| anyhow!("the paired device has no routable address"))?,
-        };
-        drop(presence);
+        let target = self.resolve_active_target(&device_id)?;
         self.set_device_paired_state(&device_id, paired);
 
         self.refresh_sync_summary();
         self.emit_devices_updated();
         self.emit_sync_status_changed();
 
-        let runtime = self.clone();
-        let local_device_id = local_device_id.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = transport::send_device_pairing_update(
-                target.socket_addr,
-                &target.fingerprint,
-                transport::DevicePairingUpdate {
-                    origin_device_id: local_device_id,
-                    target_device_id: device_id,
-                    paired,
-                },
-            )
-            .await
-            {
-                log::warn!("failed to sync device pairing to peer: {error}");
-                runtime.refresh_sync_summary();
-                runtime.emit_devices_updated();
-                runtime.emit_sync_status_changed();
-            }
-        });
+        self.sync_device_pairing_to_peer(target, device_id, paired);
 
         self.snapshot()
     }
@@ -419,7 +383,8 @@ impl RelayRuntime {
                 sequence,
             );
 
-            match transport::send_envelope(target.socket_addr, &target.fingerprint, envelope).await {
+            match transport::send_envelope(target.socket_addr, &target.fingerprint, envelope).await
+            {
                 Ok(_) => self.record_device_sync(
                     &target.device_id,
                     i18n::relayed(language, &packet.meta.kind),
@@ -441,7 +406,11 @@ impl RelayRuntime {
 
         self.remember_hash(file_list.hash.clone());
         let local_device = self.local_device();
-        let _ = self.record_local_file_history(&file_list, &local_device.device_id, &local_device.device_name);
+        let _ = self.record_local_file_history(
+            &file_list,
+            &local_device.device_id,
+            &local_device.device_name,
+        );
 
         let targets = match self.active_targets() {
             Ok(targets) if targets.is_empty() => return,
@@ -508,6 +477,9 @@ impl RelayRuntime {
         {
             return Ok(());
         }
+        if let Err(error) = self.auto_pair_device_if_only_online_peer(&envelope.origin_device_id) {
+            log::warn!("failed to auto-pair the incoming clipboard source: {error}");
+        }
 
         let kind = transport::kind_from_i32(envelope.payload_kind)?;
         let packet = clipboard::packet_from_remote(
@@ -551,6 +523,11 @@ impl RelayRuntime {
             bail!("incoming transfer is not addressed to this device");
         }
         if !self.is_paired_device(&offer.origin_device_id) {
+            if let Err(error) = self.auto_pair_device_if_only_online_peer(&offer.origin_device_id) {
+                log::warn!("failed to auto-pair the incoming transfer source: {error}");
+            }
+        }
+        if !self.is_paired_device(&offer.origin_device_id) {
             bail!("incoming file relay is only accepted from paired devices");
         }
 
@@ -581,7 +558,8 @@ impl RelayRuntime {
         };
         self.upsert_transfer_job(job, true)?;
 
-        let staging_root = store::transfers_root_path(&self.inner.state_path).join(&offer.transfer_id);
+        let staging_root =
+            store::transfers_root_path(&self.inner.state_path).join(&offer.transfer_id);
         if staging_root.exists() {
             let _ = std::fs::remove_dir_all(&staging_root);
         }
@@ -606,7 +584,10 @@ impl RelayRuntime {
             }
         }
 
-        Ok(IncomingTransferPreparation { staging_root, lease })
+        Ok(IncomingTransferPreparation {
+            staging_root,
+            lease,
+        })
     }
 
     pub fn complete_incoming_transfer(&self, transfer_id: &str) -> Result<()> {
@@ -871,7 +852,11 @@ impl RelayRuntime {
                 .service_map
                 .lock()
                 .map_err(|_| anyhow!("service map lock poisoned"))?;
-            service_map.insert(peer.service_fullname, peer.device_id);
+            service_map.insert(peer.service_fullname, peer.device_id.clone());
+        }
+
+        if self.auto_pair_device_if_only_online_peer(&peer.device_id)? {
+            return Ok(());
         }
 
         self.refresh_sync_summary();
@@ -885,6 +870,14 @@ impl RelayRuntime {
                 if let Ok(mut presence) = self.inner.presence.write() {
                     presence.remove(&device_id);
                 }
+            }
+        }
+
+        match self.auto_pair_single_online_peer() {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("failed to auto-pair the remaining online peer: {error}");
             }
         }
 
@@ -927,31 +920,18 @@ impl RelayRuntime {
 
     pub fn accept_remote_device_pairing_update(
         &self,
-        origin_device_id: &str,
-        target_device_id: &str,
-        paired: bool,
+        update: &transport::DevicePairingUpdate,
+        peer_addr: Option<SocketAddr>,
     ) -> Result<()> {
-        if target_device_id != self.local_device().device_id {
+        if update.target_device_id != self.local_device().device_id {
             bail!("device pairing update is not addressed to this device");
         }
-        if origin_device_id == self.local_device().device_id {
+        if update.origin_device_id == self.local_device().device_id {
             bail!("cannot pair this device with itself");
         }
 
-        let presence = self
-            .inner
-            .presence
-            .read()
-            .map_err(|_| anyhow!("presence lock poisoned"))?;
-        let Some(device) = presence.get(origin_device_id) else {
-            bail!("unknown device");
-        };
-        if !device.is_online {
-            bail!("device is offline");
-        }
-        drop(presence);
-
-        self.set_device_paired_state(origin_device_id, paired);
+        self.apply_pairing_route_hint(update, peer_addr.map(|address| address.ip()))?;
+        self.set_device_paired_state(&update.origin_device_id, update.paired);
         self.refresh_sync_summary();
         self.emit_devices_updated();
         self.emit_sync_status_changed();
@@ -1149,25 +1129,33 @@ impl RelayRuntime {
         paths: Vec<PathBuf>,
         cancel_flag: Arc<AtomicBool>,
     ) {
-        let prepared = match tauri::async_runtime::spawn_blocking(move || transfers::prepare_transfer(&paths))
-            .await
-        {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(error)) => {
-                let _ = self.fail_transfer(&transfer_id, error.to_string());
-                return;
-            }
-            Err(error) => {
-                let _ = self.fail_transfer(&transfer_id, format!("prepare transfer join error: {error}"));
-                return;
-            }
-        };
+        let prepared =
+            match tauri::async_runtime::spawn_blocking(move || transfers::prepare_transfer(&paths))
+                .await
+            {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    let _ = self.fail_transfer(&transfer_id, error.to_string());
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.fail_transfer(
+                        &transfer_id,
+                        format!("prepare transfer join error: {error}"),
+                    );
+                    return;
+                }
+            };
 
         let _ = self.mutate_transfer_job(&transfer_id, true, |job| {
             job.display_name = prepared.display_name.clone();
             job.total_bytes = prepared.total_bytes;
             job.total_entries = prepared.total_entries();
-            job.entries = prepared.entries.iter().map(|entry| entry.entry.clone()).collect();
+            job.entries = prepared
+                .entries
+                .iter()
+                .map(|entry| entry.entry.clone())
+                .collect();
             job.top_level_names = prepared.top_level_names.clone();
             job.warning_message = prepared.warning_message.clone();
         });
@@ -1193,7 +1181,11 @@ impl RelayRuntime {
             display_name: prepared.display_name.clone(),
             total_bytes: prepared.total_bytes,
             total_entries: prepared.total_entries(),
-            entries: prepared.entries.iter().map(|entry| entry.entry.clone()).collect(),
+            entries: prepared
+                .entries
+                .iter()
+                .map(|entry| entry.entry.clone())
+                .collect(),
             top_level_names: prepared.top_level_names.clone(),
             warning_message: prepared.warning_message.clone(),
         };
@@ -1286,23 +1278,25 @@ impl RelayRuntime {
         let mut devices = presence
             .values()
             .filter(|device| device.device_id != local_device_id)
-            .map(|device| {
-                TrustedDevice {
-                    device_id: device.device_id.clone(),
-                    name: device.name.clone(),
-                    platform: device.platform.clone(),
-                    fingerprint: device.fingerprint.clone(),
-                    auto_trusted: false,
-                    capabilities: device.capabilities.clone(),
-                    last_seen: Some(device.last_seen),
-                    last_sync_at: device.last_sync_at,
-                    last_sync_status: device.last_sync_status.clone(),
-                    addresses: device.addresses.iter().map(|address| address.to_string()).collect(),
-                    host_name: device.host_name.clone(),
-                    port: Some(device.port),
-                    is_online: device.is_online,
-                    is_active: active_device_ids.iter().any(|id| id == &device.device_id),
-                }
+            .map(|device| TrustedDevice {
+                device_id: device.device_id.clone(),
+                name: device.name.clone(),
+                platform: device.platform.clone(),
+                fingerprint: device.fingerprint.clone(),
+                auto_trusted: false,
+                capabilities: device.capabilities.clone(),
+                last_seen: Some(device.last_seen),
+                last_sync_at: device.last_sync_at,
+                last_sync_status: device.last_sync_status.clone(),
+                addresses: device
+                    .addresses
+                    .iter()
+                    .map(|address| address.to_string())
+                    .collect(),
+                host_name: device.host_name.clone(),
+                port: (device.port > 0).then_some(device.port),
+                is_online: device.is_online,
+                is_active: active_device_ids.iter().any(|id| id == &device.device_id),
             })
             .collect::<Vec<_>>();
 
@@ -1332,16 +1326,10 @@ impl RelayRuntime {
             if !online.is_online {
                 continue;
             }
-
-            let Some(socket_addr) = preferred_socket_addr(&online.addresses, online.port) else {
+            let Some(target) = active_target_from_presence(online) else {
                 continue;
             };
-
-            targets.push(ActiveTarget {
-                device_id: active_device_id,
-                fingerprint: online.fingerprint.clone(),
-                socket_addr,
-            });
+            targets.push(target);
         }
 
         Ok(targets)
@@ -1400,6 +1388,203 @@ impl RelayRuntime {
         self.active_device_ids_clone()
             .iter()
             .any(|active_device_id| active_device_id == device_id)
+    }
+
+    fn resolve_active_target(&self, device_id: &str) -> Result<ActiveTarget> {
+        let presence = self
+            .inner
+            .presence
+            .read()
+            .map_err(|_| anyhow!("presence lock poisoned"))?;
+        let Some(device) = presence.get(device_id) else {
+            bail!("unknown device");
+        };
+        if !device.is_online {
+            bail!("device is offline");
+        }
+        active_target_from_presence(device)
+            .ok_or_else(|| anyhow!("the paired device has no routable address"))
+    }
+
+    fn sync_device_pairing_to_peer(&self, target: ActiveTarget, device_id: String, paired: bool) {
+        let runtime = self.clone();
+        let update = self.build_device_pairing_update(device_id, paired);
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = transport::send_device_pairing_update(
+                target.socket_addr,
+                &target.fingerprint,
+                update,
+            )
+            .await
+            {
+                log::warn!("failed to sync device pairing to peer: {error}");
+                runtime.refresh_sync_summary();
+                runtime.emit_devices_updated();
+                runtime.emit_sync_status_changed();
+            }
+        });
+    }
+
+    fn build_device_pairing_update(
+        &self,
+        target_device_id: String,
+        paired: bool,
+    ) -> transport::DevicePairingUpdate {
+        let local_device = self.local_device();
+        transport::DevicePairingUpdate {
+            origin_device_id: local_device.device_id,
+            target_device_id,
+            paired,
+            origin_device_name: local_device.device_name,
+            origin_platform: local_device.platform,
+            origin_capabilities: local_device.capabilities,
+            origin_fingerprint: local_device.fingerprint,
+            origin_listen_port: (self.listen_port() > 0).then_some(self.listen_port()),
+        }
+    }
+
+    fn auto_pair_device_if_only_online_peer(&self, device_id: &str) -> Result<bool> {
+        if self.single_auto_pair_candidate()?.as_deref() != Some(device_id) {
+            return Ok(false);
+        }
+
+        self.set_device_pairing(device_id.to_string(), true)?;
+        Ok(true)
+    }
+
+    fn auto_pair_single_online_peer(&self) -> Result<bool> {
+        let Some(device_id) = self.single_auto_pair_candidate()? else {
+            return Ok(false);
+        };
+
+        self.set_device_pairing(device_id, true)?;
+        Ok(true)
+    }
+
+    fn single_auto_pair_candidate(&self) -> Result<Option<String>> {
+        let local_device_id = self.local_device().device_id;
+        let active_device_ids = self.active_device_ids_clone();
+        let presence = self
+            .inner
+            .presence
+            .read()
+            .map_err(|_| anyhow!("presence lock poisoned"))?;
+        let online_peers = presence
+            .values()
+            .filter(|device| device.is_online && device.device_id != local_device_id)
+            .collect::<Vec<_>>();
+        if online_peers.len() != 1 {
+            return Ok(None);
+        }
+
+        if active_device_ids.iter().any(|device_id| {
+            presence
+                .get(device_id)
+                .is_some_and(|device| device.is_online)
+        }) {
+            return Ok(None);
+        }
+
+        let candidate = online_peers[0];
+        if active_device_ids
+            .iter()
+            .any(|active_device_id| active_device_id == &candidate.device_id)
+        {
+            return Ok(None);
+        }
+        if active_target_from_presence(candidate).is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(candidate.device_id.clone()))
+    }
+
+    fn apply_pairing_route_hint(
+        &self,
+        update: &transport::DevicePairingUpdate,
+        peer_ip: Option<IpAddr>,
+    ) -> Result<()> {
+        if !update.paired {
+            return Ok(());
+        }
+
+        let mut presence = self
+            .inner
+            .presence
+            .write()
+            .map_err(|_| anyhow!("presence lock poisoned"))?;
+        let previous = presence.get(&update.origin_device_id).cloned();
+        let mut addresses = peer_ip.into_iter().collect::<Vec<_>>();
+        if addresses.is_empty() {
+            addresses = previous
+                .as_ref()
+                .map(|device| device.addresses.clone())
+                .unwrap_or_default();
+        }
+
+        let port = update
+            .origin_listen_port
+            .filter(|port| *port > 0)
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|device| device.port)
+                    .filter(|port| *port > 0)
+            })
+            .unwrap_or_default();
+        let name = if update.origin_device_name.trim().is_empty() {
+            previous
+                .as_ref()
+                .map(|device| device.name.clone())
+                .unwrap_or_else(|| update.origin_device_id.clone())
+        } else {
+            update.origin_device_name.clone()
+        };
+        let platform = if update.origin_platform.trim().is_empty() {
+            previous
+                .as_ref()
+                .map(|device| device.platform.clone())
+                .unwrap_or_else(|| "Unknown".to_string())
+        } else {
+            update.origin_platform.clone()
+        };
+        let fingerprint = if update.origin_fingerprint.trim().is_empty() {
+            previous
+                .as_ref()
+                .map(|device| device.fingerprint.clone())
+                .unwrap_or_default()
+        } else {
+            update.origin_fingerprint.clone()
+        };
+        let capabilities = if update.origin_capabilities.is_empty() {
+            previous
+                .as_ref()
+                .map(|device| device.capabilities.clone())
+                .unwrap_or_default()
+        } else {
+            update.origin_capabilities.clone()
+        };
+
+        presence.insert(
+            update.origin_device_id.clone(),
+            DevicePresence {
+                device_id: update.origin_device_id.clone(),
+                name,
+                platform,
+                fingerprint,
+                capabilities,
+                host_name: previous
+                    .as_ref()
+                    .and_then(|device| device.host_name.clone()),
+                addresses,
+                port,
+                is_online: true,
+                last_seen: Utc::now(),
+                last_sync_at: previous.as_ref().and_then(|device| device.last_sync_at),
+                last_sync_status: previous.and_then(|device| device.last_sync_status),
+            },
+        );
+        Ok(())
     }
 
     fn device_name_for(&self, device_id: &str) -> String {
@@ -1585,11 +1770,11 @@ impl RelayRuntime {
     }
 
     fn find_transfer_job(&self, transfer_id: &str) -> Option<TransferJob> {
-        self.inner
-            .transfer_jobs
-            .read()
-            .ok()
-            .and_then(|jobs| jobs.iter().find(|job| job.transfer_id == transfer_id).cloned())
+        self.inner.transfer_jobs.read().ok().and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job.transfer_id == transfer_id)
+                .cloned()
+        })
     }
 
     fn available_actions_for_job(&self, job: &TransferJob) -> Vec<TransferAction> {
@@ -1628,13 +1813,19 @@ impl RelayRuntime {
                 .transfer_jobs
                 .write()
                 .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
-            if let Some(existing) = jobs.iter_mut().find(|existing| existing.transfer_id == job.transfer_id)
+            if let Some(existing) = jobs
+                .iter_mut()
+                .find(|existing| existing.transfer_id == job.transfer_id)
             {
                 *existing = job;
             } else {
                 jobs.push(job);
             }
-            if persist { Some(jobs.clone()) } else { None }
+            if persist {
+                Some(jobs.clone())
+            } else {
+                None
+            }
         };
 
         if let Some(snapshot) = snapshot {
@@ -1661,10 +1852,13 @@ impl RelayRuntime {
                 .transfer_jobs
                 .write()
                 .map_err(|_| anyhow!("transfer jobs lock poisoned"))?;
-            let updated = jobs.iter_mut().find(|job| job.transfer_id == transfer_id).map(|job| {
-                apply(job);
-                job.clone()
-            });
+            let updated = jobs
+                .iter_mut()
+                .find(|job| job.transfer_id == transfer_id)
+                .map(|job| {
+                    apply(job);
+                    job.clone()
+                });
             let snapshot = if persist { Some(jobs.clone()) } else { None };
             (updated, snapshot)
         };
@@ -1690,7 +1884,10 @@ impl RelayRuntime {
             if let Some(staging_path) = staging_path.clone() {
                 job.staging_path = Some(staging_path);
             }
-            if matches!(stage, TransferStage::Failed | TransferStage::Canceled | TransferStage::Ready) {
+            if matches!(
+                stage,
+                TransferStage::Failed | TransferStage::Canceled | TransferStage::Ready
+            ) {
                 job.finished_at = Some(Utc::now());
             }
         })
@@ -1761,6 +1958,10 @@ fn transfer_sort_rank(job: &TransferJob) -> (u8, u8) {
 }
 
 fn preferred_socket_addr(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> {
+    if port == 0 {
+        return None;
+    }
+
     addresses
         .iter()
         .find(|address| matches!(address, IpAddr::V4(ip) if ip.is_private()))
@@ -1781,6 +1982,14 @@ fn preferred_socket_addr(addresses: &[IpAddr], port: u16) -> Option<SocketAddr> 
             })
         })
         .map(|address| SocketAddr::new(*address, port))
+}
+
+fn active_target_from_presence(device: &DevicePresence) -> Option<ActiveTarget> {
+    Some(ActiveTarget {
+        device_id: device.device_id.clone(),
+        fingerprint: device.fingerprint.clone(),
+        socket_addr: preferred_socket_addr(&device.addresses, device.port)?,
+    })
 }
 
 fn relative_path_to_native(relative_path: &str) -> PathBuf {

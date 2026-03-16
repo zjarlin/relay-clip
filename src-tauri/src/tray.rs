@@ -154,7 +154,8 @@ mod platform {
         let open_item =
             MenuItemBuilder::with_id("open-settings", i18n::tray_open_settings(language))
                 .build(app)?;
-        let quit_item = MenuItemBuilder::with_id("quit-app", i18n::tray_quit(language)).build(app)?;
+        let quit_item =
+            MenuItemBuilder::with_id("quit-app", i18n::tray_quit(language)).build(app)?;
         builder = builder.item(&toggle_item);
         builder = builder.item(&open_item);
         builder = builder.item(&PredefinedMenuItem::separator(app)?);

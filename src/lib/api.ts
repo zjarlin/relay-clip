@@ -41,6 +41,10 @@ export function setDevicePairing(deviceId: string, paired: boolean) {
   return invoke<AppStateSnapshot>('set_device_pairing', { deviceId, paired })
 }
 
+export function setDeviceRemark(deviceId: string, remark: string | null) {
+  return invoke<AppStateSnapshot>('set_device_remark', { deviceId, remark })
+}
+
 export function toggleSync(enabled: boolean) {
   return invoke<AppStateSnapshot>('toggle_sync', { enabled })
 }

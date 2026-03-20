@@ -32,6 +32,7 @@
     placeReceivedTransferOnClipboard,
     requestRuntimePermissions,
     restoreClipboardHistoryEntry,
+    setDeviceRemark,
     setDevicePairing,
     shareReceivedTransfer,
     syncAutostart,
@@ -99,10 +100,12 @@
   let busyTransferId: string | null = null
   let busyHistoryId: string | null = null
   let busyPairingId: string | null = null
+  let busyRemarkId: string | null = null
   let settingsBusy = false
   let permissionsBusy = false
   let errorBanner: string | null = null
   let activeTab: 'devices' | 'history' | 'settings' = 'devices'
+  let remarkDrafts: Record<string, string> = {}
   const notifiedReady = new Set<string>()
 
   $: currentLanguage =
@@ -191,6 +194,7 @@
     transferJobs = jobs
     clipboardHistory = history
     backgroundSyncState = backgroundState
+    remarkDrafts = buildRemarkDrafts(state.devices, remarkDrafts)
 
     try {
       if (state.capabilities.autostart) {
@@ -235,6 +239,21 @@
       errorBanner = error instanceof Error ? error.message : String(error)
     } finally {
       busyPairingId = null
+    }
+  }
+
+  async function saveDeviceRemark(deviceId: string) {
+    busyRemarkId = deviceId
+    errorBanner = null
+    try {
+      const remark = remarkDrafts[deviceId]?.trim() ?? ''
+      const nextDrafts = { ...remarkDrafts, [deviceId]: remark }
+      snapshot = await setDeviceRemark(deviceId, remark.length > 0 ? remark : null)
+      remarkDrafts = buildRemarkDrafts(snapshot.devices, nextDrafts)
+    } catch (error) {
+      errorBanner = error instanceof Error ? error.message : String(error)
+    } finally {
+      busyRemarkId = null
     }
   }
 
@@ -423,6 +442,32 @@
     return platform
   }
 
+  function displayDeviceName(device: AppStateSnapshot['devices'][number]) {
+    return device.remark?.trim() ? device.remark : device.name
+  }
+
+  function deviceMetaLabel(device: AppStateSnapshot['devices'][number]) {
+    if (device.remark?.trim()) {
+      return `${device.name} · ${platformLabel(device.platform)}`
+    }
+
+    return platformLabel(device.platform)
+  }
+
+  function buildRemarkDrafts(
+    devices: AppStateSnapshot['devices'],
+    current: Record<string, string>,
+  ) {
+    return Object.fromEntries(
+      devices.map((device) => [
+        device.deviceId,
+        busyRemarkId === device.deviceId
+          ? (current[device.deviceId] ?? '')
+          : (device.remark ?? ''),
+      ]),
+    )
+  }
+
   function formatBytes(value: number) {
     if (value <= 0) return '0 B'
     const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -533,6 +578,7 @@
       onDevicesUpdated((devices) => {
         if (!snapshot || disposed) return
         snapshot = { ...snapshot, devices }
+        remarkDrafts = buildRemarkDrafts(devices, remarkDrafts)
       }),
       onSyncStatusChanged((status) => {
         if (!snapshot || disposed) return
@@ -563,7 +609,7 @@
   <div class="min-h-[100dvh] bg-[radial-gradient(circle_at_top,rgba(15,23,42,0.05),transparent_40%),linear-gradient(180deg,rgba(248,250,252,0.96),rgba(241,245,249,0.88))]">
     <div class="mx-auto flex min-h-[100dvh] w-full max-w-6xl flex-col px-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))] pt-4 md:px-6 lg:px-8">
       <section class="sticky top-0 z-20 -mx-4 border-b border-border/60 bg-background/92 px-4 pb-4 pt-[max(env(safe-area-inset-top),1rem)] backdrop-blur md:mx-0 md:rounded-[28px] md:border md:px-6 md:shadow-sm lg:static lg:mb-6">
-        <div class="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+        <div class="flex flex-col gap-5">
           <div class="space-y-3">
             <div class="flex items-center gap-4">
               <div class="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-sm">
@@ -577,44 +623,6 @@
             <p class="max-w-2xl text-sm leading-6 text-muted-foreground">
               {syncStatus?.message ?? ui.currentDeviceHint}
             </p>
-          </div>
-
-          <div class="grid gap-3 sm:grid-cols-2 lg:min-w-[420px]">
-            <div class="rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-sm">
-              <div class="flex items-center justify-between gap-3">
-                <div class="space-y-1">
-                  <p class="text-xs uppercase tracking-[0.24em] text-muted-foreground">
-                    {copy.syncState(syncStatus?.state ?? 'discovering')}
-                  </p>
-                  <p class="text-sm font-medium text-foreground">
-                    {syncStatus?.lastPayload
-                      ? `${syncStatus.lastPayload.kind} · ${formatBytes(syncStatus.lastPayload.size)}`
-                      : ui.currentDeviceHint}
-                  </p>
-                </div>
-                <Badge
-                  variant="outline"
-                  class={cn(
-                    'rounded-full px-3 py-1 text-xs font-medium',
-                    syncBadgeClass(syncStatus?.state),
-                  )}
-                >
-                  {syncStatus?.state === 'syncing' ? copy.syncState('syncing') : copy.syncState(syncStatus?.state ?? 'idle')}
-                </Badge>
-              </div>
-            </div>
-
-            <div class="flex items-center justify-between gap-4 rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-sm">
-              <div class="space-y-1">
-                <p class="text-sm font-medium text-foreground">{copy.syncEnabled}</p>
-                <p class="text-xs leading-5 text-muted-foreground">{copy.noPairedDevicesHint}</p>
-              </div>
-              <Switch
-                checked={snapshot.settings.syncEnabled}
-                disabled={settingsBusy}
-                on:change={(event) => toggleClipboardSync(checkedFromEvent(event))}
-              />
-            </div>
           </div>
         </div>
 
@@ -668,82 +676,110 @@
       {/if}
 
       {#if activeTab === 'devices'}
-        <div class="mt-4 grid gap-4 xl:grid-cols-[1.15fr,0.85fr]">
-          <div class="space-y-4">
-            <Card class="border-border/70 shadow-sm">
-              <CardHeader class="pb-2">
-                <div class="flex items-start justify-between gap-3">
-                  <div>
-                    <CardTitle>{ui.currentDevice}</CardTitle>
-                    <CardDescription>{ui.currentDeviceHint}</CardDescription>
-                  </div>
-                  <Badge variant="secondary" class="rounded-full px-3 py-1 text-xs">
-                    {copy.thisDevice}
-                  </Badge>
+        <div class="mt-4 space-y-4">
+          <Card class="border-border/70 shadow-sm">
+            <CardHeader class="pb-2">
+              <CardTitle>{copy.nearby}</CardTitle>
+              <CardDescription>{ui.availableHint}</CardDescription>
+            </CardHeader>
+            <CardContent class="space-y-3">
+              {#if nearbyDevices.length === 0}
+                <div class="rounded-2xl border border-dashed border-border bg-muted/30 px-4 py-10 text-center">
+                  <Wifi class="mx-auto mb-3 text-muted-foreground" size={28} />
+                  <p class="text-sm font-medium">{copy.noNearbyDevices}</p>
+                  <p class="mt-2 text-sm text-muted-foreground">{copy.nearbyDevicesHint}</p>
                 </div>
-              </CardHeader>
-              <CardContent class="space-y-4">
-                <div class="flex items-center gap-4 rounded-2xl border border-border/70 bg-muted/40 p-4">
-                  <div class="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                    {#if isMobilePlatform(localDevice?.platform ?? '')}
-                      <Smartphone size={22} />
-                    {:else}
-                      <Laptop2 size={22} />
-                    {/if}
-                  </div>
-                  <div class="min-w-0 flex-1">
-                    <div class="truncate text-base font-semibold">{snapshot.settings.deviceName}</div>
-                    <div class="mt-1 text-sm text-muted-foreground">
-                      {platformLabel(localDevice?.platform ?? '')}
+              {:else}
+                {#each nearbyDevices as device}
+                  <article class="space-y-4 rounded-2xl border border-border/70 bg-muted/30 p-4">
+                    <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div class="flex min-w-0 items-start gap-4">
+                        <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-border bg-card text-muted-foreground">
+                          <svelte:component this={platformIconComponent(device.platform)} size={20} />
+                        </div>
+                        <div class="min-w-0 space-y-1">
+                          <div class="truncate text-sm font-semibold">{displayDeviceName(device)}</div>
+                          <div class="text-sm text-muted-foreground">
+                            {deviceMetaLabel(device)}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="flex flex-wrap items-center gap-2">
+                        <Badge
+                          variant="outline"
+                          class={cn(
+                            'rounded-full px-3 py-1 text-xs font-medium',
+                            presenceBadgeClass(device.isOnline),
+                          )}
+                        >
+                          {device.isOnline ? copy.online : copy.offline}
+                        </Badge>
+                        <Button
+                          size="sm"
+                          disabled={busyPairingId === device.deviceId}
+                          on:click={() => updatePairing(device.deviceId, true)}
+                        >
+                          {busyPairingId === device.deviceId ? copy.saving : copy.pair}
+                        </Button>
+                      </div>
                     </div>
-                  </div>
-                  <Badge
-                    variant="outline"
-                    class="rounded-full border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700"
-                  >
-                    {copy.online}
-                  </Badge>
-                </div>
 
-                <div class="grid gap-3 sm:grid-cols-3">
-                  <div class="rounded-2xl bg-muted/60 p-3">
-                    <div class="text-xs uppercase tracking-wide text-muted-foreground">{ui.onlinePeers}</div>
-                    <div class="mt-2 text-lg font-semibold">{onlinePeerCount}</div>
-                  </div>
-                  <div class="rounded-2xl bg-muted/60 p-3">
-                    <div class="text-xs uppercase tracking-wide text-muted-foreground">{ui.readyPeers}</div>
-                    <div class="mt-2 text-lg font-semibold">{pairedOnlineCount}</div>
-                  </div>
-                  <div class="rounded-2xl bg-muted/60 p-3">
-                    <div class="text-xs uppercase tracking-wide text-muted-foreground">{ui.protocol}</div>
-                    <div class="mt-2 text-sm font-semibold">{localDevice?.protocolVersion}</div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
+                    <div class="space-y-2">
+                      <label class="text-sm font-medium" for={`remark-${device.deviceId}`}>
+                        {copy.deviceRemark}
+                      </label>
+                      <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <Input
+                          id={`remark-${device.deviceId}`}
+                          value={remarkDrafts[device.deviceId] ?? ''}
+                          placeholder={copy.deviceRemarkPlaceholder}
+                          on:input={(event) => {
+                            remarkDrafts = {
+                              ...remarkDrafts,
+                              [device.deviceId]: inputValueFromEvent(event),
+                            }
+                          }}
+                        />
+                        <Button
+                          variant="outline"
+                          class="sm:w-auto"
+                          disabled={busyRemarkId === device.deviceId}
+                          on:click={() => saveDeviceRemark(device.deviceId)}
+                        >
+                          {busyRemarkId === device.deviceId ? copy.saving : copy.save}
+                        </Button>
+                      </div>
+                    </div>
+                  </article>
+                {/each}
+              {/if}
+            </CardContent>
+          </Card>
 
-            <Card class="border-border/70 shadow-sm">
-              <CardHeader class="pb-2">
-                <div class="flex items-start justify-between gap-3">
-                  <div>
-                    <CardTitle>{copy.pairedDevices}</CardTitle>
-                    <CardDescription>{copy.noPairedDevicesHint}</CardDescription>
-                  </div>
-                  <Badge variant="outline" class="rounded-full px-3 py-1 text-xs">
-                    {copy.pairedDevicesCount(pairedDevices.length)}
-                  </Badge>
+          <Card class="border-border/70 shadow-sm">
+            <CardHeader class="pb-2">
+              <div class="flex items-start justify-between gap-3">
+                <div>
+                  <CardTitle>{copy.pairedDevices}</CardTitle>
+                  <CardDescription>{copy.noPairedDevicesHint}</CardDescription>
                 </div>
-              </CardHeader>
-              <CardContent class="space-y-3">
-                {#if pairedDevices.length === 0}
-                  <div class="rounded-2xl border border-dashed border-border bg-muted/30 px-4 py-10 text-center">
-                    <WifiOff class="mx-auto mb-3 text-muted-foreground" size={28} />
-                    <p class="text-sm font-medium">{copy.noPairedDevices}</p>
-                    <p class="mt-2 text-sm text-muted-foreground">{copy.noPairedDevicesHint}</p>
-                  </div>
-                {:else}
-                  {#each pairedDevices as device}
-                    <article class="flex flex-col gap-4 rounded-2xl border border-border/70 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+                <Badge variant="outline" class="rounded-full px-3 py-1 text-xs">
+                  {copy.pairedDevicesCount(pairedDevices.length)}
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent class="space-y-3">
+              {#if pairedDevices.length === 0}
+                <div class="rounded-2xl border border-dashed border-border bg-muted/30 px-4 py-10 text-center">
+                  <WifiOff class="mx-auto mb-3 text-muted-foreground" size={28} />
+                  <p class="text-sm font-medium">{copy.noPairedDevices}</p>
+                  <p class="mt-2 text-sm text-muted-foreground">{copy.noPairedDevicesHint}</p>
+                </div>
+              {:else}
+                {#each pairedDevices as device}
+                  <article class="space-y-4 rounded-2xl border border-border/70 bg-muted/30 p-4">
+                    <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                       <div class="flex min-w-0 items-start gap-4">
                         <div
                           class={cn(
@@ -756,9 +792,9 @@
                           <svelte:component this={platformIconComponent(device.platform)} size={20} />
                         </div>
                         <div class="min-w-0 space-y-1">
-                          <div class="truncate text-sm font-semibold">{device.name}</div>
+                          <div class="truncate text-sm font-semibold">{displayDeviceName(device)}</div>
                           <div class="text-sm text-muted-foreground">
-                            {platformLabel(device.platform)}
+                            {deviceMetaLabel(device)}
                           </div>
                         </div>
                       </div>
@@ -785,217 +821,151 @@
                           {busyPairingId === device.deviceId ? copy.saving : copy.unpair}
                         </Button>
                       </div>
-                    </article>
-                  {/each}
-                {/if}
-              </CardContent>
-            </Card>
+                    </div>
 
-            <Card class="border-border/70 shadow-sm">
-              <CardHeader class="pb-2">
-                <CardTitle>{copy.nearby}</CardTitle>
-                <CardDescription>{ui.availableHint}</CardDescription>
-              </CardHeader>
-              <CardContent class="space-y-3">
-                {#if nearbyDevices.length === 0}
-                  <div class="rounded-2xl border border-dashed border-border bg-muted/30 px-4 py-10 text-center">
-                    <Wifi class="mx-auto mb-3 text-muted-foreground" size={28} />
-                    <p class="text-sm font-medium">{copy.noNearbyDevices}</p>
-                    <p class="mt-2 text-sm text-muted-foreground">{copy.nearbyDevicesHint}</p>
-                  </div>
-                {:else}
-                  {#each nearbyDevices as device}
-                    <article class="flex flex-col gap-4 rounded-2xl border border-border/70 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
-                      <div class="flex min-w-0 items-start gap-4">
-                        <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-border bg-card text-muted-foreground">
-                          <svelte:component this={platformIconComponent(device.platform)} size={20} />
-                        </div>
-                        <div class="min-w-0 space-y-1">
-                          <div class="truncate text-sm font-semibold">{device.name}</div>
-                          <div class="text-sm text-muted-foreground">
-                            {platformLabel(device.platform)}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div class="flex flex-wrap items-center gap-2">
-                        <Badge
-                          variant="outline"
-                          class={cn(
-                            'rounded-full px-3 py-1 text-xs font-medium',
-                            presenceBadgeClass(device.isOnline),
-                          )}
-                        >
-                          {device.isOnline ? copy.online : copy.offline}
-                        </Badge>
+                    <div class="space-y-2">
+                      <label class="text-sm font-medium" for={`remark-${device.deviceId}`}>
+                        {copy.deviceRemark}
+                      </label>
+                      <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <Input
+                          id={`remark-${device.deviceId}`}
+                          value={remarkDrafts[device.deviceId] ?? ''}
+                          placeholder={copy.deviceRemarkPlaceholder}
+                          on:input={(event) => {
+                            remarkDrafts = {
+                              ...remarkDrafts,
+                              [device.deviceId]: inputValueFromEvent(event),
+                            }
+                          }}
+                        />
                         <Button
-                          size="sm"
-                          disabled={busyPairingId === device.deviceId}
-                          on:click={() => updatePairing(device.deviceId, true)}
+                          variant="outline"
+                          class="sm:w-auto"
+                          disabled={busyRemarkId === device.deviceId}
+                          on:click={() => saveDeviceRemark(device.deviceId)}
                         >
-                          {busyPairingId === device.deviceId ? copy.saving : copy.pair}
+                          {busyRemarkId === device.deviceId ? copy.saving : copy.save}
                         </Button>
                       </div>
-                    </article>
-                  {/each}
-                {/if}
-              </CardContent>
-            </Card>
-          </div>
-
-          <div class="space-y-4">
-            <Card class="border-border/70 shadow-sm">
-              <CardHeader class="pb-2">
-                <CardTitle>{copy.transfers}</CardTitle>
-                <CardDescription>{ui.transferHint}</CardDescription>
-              </CardHeader>
-              <CardContent class="space-y-3">
-                {#if visibleTransferJobs.length === 0}
-                  <div class="rounded-2xl border border-dashed border-border bg-muted/30 px-4 py-10 text-center">
-                    <Download class="mx-auto mb-3 text-muted-foreground" size={28} />
-                    <p class="text-sm font-medium">{copy.noTransfers}</p>
-                    <p class="mt-2 text-sm text-muted-foreground">{ui.transferHint}</p>
-                  </div>
-                {:else}
-                  {#each visibleTransferJobs as job}
-                    <article class="rounded-2xl border border-border/70 bg-muted/30 p-4">
-                      <div class="flex items-start justify-between gap-3">
-                        <div class="min-w-0">
-                          <div class="truncate text-sm font-semibold">{job.displayName}</div>
-                          <div class="mt-1 text-sm text-muted-foreground">
-                            {formatTime(job.startedAt)} · {copy.transferState(job.stage, job.direction)}
-                          </div>
-                        </div>
-                        <Badge
-                          variant="outline"
-                          class={cn(
-                            'rounded-full px-3 py-1 text-xs font-medium',
-                            job.stage === 'ready'
-                              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                              : job.errorMessage
-                                ? 'border-destructive/30 bg-destructive/10 text-destructive'
-                                : 'border-sky-200 bg-sky-50 text-sky-700',
-                          )}
-                        >
-                          {progress(job)}%
-                        </Badge>
-                      </div>
-
-                      <div class="mt-4 space-y-3">
-                        <Progress value={progress(job)} class="h-2.5" />
-                        <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-                          <span>{formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)}</span>
-                          <span>{copy.transferSummary(job.completedEntries, job.totalEntries)}</span>
-                        </div>
-
-                        {#if job.errorMessage}
-                          <p class="text-sm text-destructive">{job.errorMessage}</p>
-                        {/if}
-
-                        {#if job.stage === 'ready' && job.direction === 'inbound'}
-                          <div class="flex flex-wrap gap-2">
-                            {#if hasAction(job, 'placeOnClipboard')}
-                              <Button
-                                size="sm"
-                                disabled={busyTransferId === job.transferId}
-                                on:click={() => placeTransfer(job)}
-                              >
-                                {busyTransferId === job.transferId ? copy.saving : copy.placeOnClipboard}
-                              </Button>
-                            {/if}
-                            {#if hasAction(job, 'shareExternally')}
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={busyTransferId === job.transferId}
-                                on:click={() => shareTransfer(job)}
-                              >
-                                <Share2 size={14} />
-                                <span>{busyTransferId === job.transferId ? copy.saving : copy.shareExternally}</span>
-                              </Button>
-                            {/if}
-                            {#if hasAction(job, 'exportToFiles')}
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={busyTransferId === job.transferId}
-                                on:click={() => exportTransfer(job)}
-                              >
-                                <Download size={14} />
-                                <span>{busyTransferId === job.transferId ? copy.saving : copy.exportToFiles}</span>
-                              </Button>
-                            {/if}
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              disabled={busyTransferId === job.transferId}
-                              on:click={() => dismissTransfer(job)}
-                            >
-                              {copy.dismiss}
-                            </Button>
-                          </div>
-                          {#if job.availableActions.length === 0}
-                            <p class="text-sm text-muted-foreground">{copy.actionsUnavailable}</p>
-                          {/if}
-                        {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
-                          <div class="flex flex-wrap gap-2">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              disabled={busyTransferId === job.transferId}
-                              on:click={() => cancelTransfer(job)}
-                            >
-                              {copy.cancel}
-                            </Button>
-                          </div>
-                        {/if}
-                      </div>
-                    </article>
-                  {/each}
-                {/if}
-              </CardContent>
-            </Card>
-
-            <Card class="border-border/70 shadow-sm">
-              <CardHeader class="pb-2">
-                <CardTitle>{copy.environment}</CardTitle>
-                <CardDescription>{ui.runtimeHint}</CardDescription>
-              </CardHeader>
-              <CardContent class="space-y-3">
-                <div class="grid gap-3 sm:grid-cols-2">
-                  <div class="rounded-2xl bg-muted/60 p-3">
-                    <div class="text-xs uppercase tracking-wide text-muted-foreground">
-                      {copy.environment}
                     </div>
-                    <div class="mt-2 text-sm font-semibold">
-                      {copy.runtimePlatform(runtimePlatform)}
-                    </div>
-                  </div>
-                  <div class="rounded-2xl bg-muted/60 p-3">
-                    <div class="text-xs uppercase tracking-wide text-muted-foreground">
-                      {copy.backgroundSync}
-                    </div>
-                    <div class="mt-2 text-sm font-semibold">
-                      {copy.backgroundMode(
-                        backgroundSyncState?.mode ?? 'unsupported',
-                        backgroundSyncState?.active ?? false,
-                      )}
-                    </div>
-                  </div>
+                  </article>
+                {/each}
+              {/if}
+            </CardContent>
+          </Card>
+
+          <Card class="border-border/70 shadow-sm">
+            <CardHeader class="pb-2">
+              <CardTitle>{copy.transfers}</CardTitle>
+              <CardDescription>{ui.transferHint}</CardDescription>
+            </CardHeader>
+            <CardContent class="space-y-3">
+              {#if visibleTransferJobs.length === 0}
+                <div class="rounded-2xl border border-dashed border-border bg-muted/30 px-4 py-10 text-center">
+                  <Download class="mx-auto mb-3 text-muted-foreground" size={28} />
+                  <p class="text-sm font-medium">{copy.noTransfers}</p>
+                  <p class="mt-2 text-sm text-muted-foreground">{ui.transferHint}</p>
                 </div>
+              {:else}
+                {#each visibleTransferJobs as job}
+                  <article class="rounded-2xl border border-border/70 bg-muted/30 p-4">
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <div class="truncate text-sm font-semibold">{job.displayName}</div>
+                        <div class="mt-1 text-sm text-muted-foreground">
+                          {formatTime(job.startedAt)} · {copy.transferState(job.stage, job.direction)}
+                        </div>
+                      </div>
+                      <Badge
+                        variant="outline"
+                        class={cn(
+                          'rounded-full px-3 py-1 text-xs font-medium',
+                          job.stage === 'ready'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                            : job.errorMessage
+                              ? 'border-destructive/30 bg-destructive/10 text-destructive'
+                              : 'border-sky-200 bg-sky-50 text-sky-700',
+                        )}
+                      >
+                        {progress(job)}%
+                      </Badge>
+                    </div>
 
-                {#if isMobile}
-                  <p class="text-sm text-muted-foreground">{copy.mobileLimitedHint}</p>
-                {/if}
+                    <div class="mt-4 space-y-3">
+                      <Progress value={progress(job)} class="h-2.5" />
+                      <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                        <span>{formatBytes(job.completedBytes)} / {formatBytes(job.totalBytes)}</span>
+                        <span>{copy.transferSummary(job.completedEntries, job.totalEntries)}</span>
+                      </div>
 
-                {#if runtimeCapabilities.openCacheDirectory}
-                  <Button variant="outline" class="w-full sm:w-auto" on:click={openCache}>
-                    {copy.openCacheDirectory}
-                  </Button>
-                {/if}
-              </CardContent>
-            </Card>
-          </div>
+                      {#if job.errorMessage}
+                        <p class="text-sm text-destructive">{job.errorMessage}</p>
+                      {/if}
+
+                      {#if job.stage === 'ready' && job.direction === 'inbound'}
+                        <div class="flex flex-wrap gap-2">
+                          {#if hasAction(job, 'placeOnClipboard')}
+                            <Button
+                              size="sm"
+                              disabled={busyTransferId === job.transferId}
+                              on:click={() => placeTransfer(job)}
+                            >
+                              {busyTransferId === job.transferId ? copy.saving : copy.placeOnClipboard}
+                            </Button>
+                          {/if}
+                          {#if hasAction(job, 'shareExternally')}
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busyTransferId === job.transferId}
+                              on:click={() => shareTransfer(job)}
+                            >
+                              <Share2 size={14} />
+                              <span>{busyTransferId === job.transferId ? copy.saving : copy.shareExternally}</span>
+                            </Button>
+                          {/if}
+                          {#if hasAction(job, 'exportToFiles')}
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busyTransferId === job.transferId}
+                              on:click={() => exportTransfer(job)}
+                            >
+                              <Download size={14} />
+                              <span>{busyTransferId === job.transferId ? copy.saving : copy.exportToFiles}</span>
+                            </Button>
+                          {/if}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={busyTransferId === job.transferId}
+                            on:click={() => dismissTransfer(job)}
+                          >
+                            {copy.dismiss}
+                          </Button>
+                        </div>
+                        {#if job.availableActions.length === 0}
+                          <p class="text-sm text-muted-foreground">{copy.actionsUnavailable}</p>
+                        {/if}
+                      {:else if ['preparing', 'queued', 'downloading', 'verifying'].includes(job.stage)}
+                        <div class="flex flex-wrap gap-2">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={busyTransferId === job.transferId}
+                            on:click={() => cancelTransfer(job)}
+                          >
+                            {copy.cancel}
+                          </Button>
+                        </div>
+                      {/if}
+                    </div>
+                  </article>
+                {/each}
+              {/if}
+            </CardContent>
+          </Card>
         </div>
       {/if}
 

@@ -74,6 +74,7 @@ export interface AppSettings {
   discoveryEnabled: boolean
   syncEnabled: boolean
   activeDeviceIds: string[]
+  deviceRemarks: Record<string, string>
   language: AppLanguage
 }
 
@@ -114,6 +115,7 @@ export interface ClipboardHistoryEntry {
 export interface TrustedDevice {
   deviceId: string
   name: string
+  remark: string | null
   platform: string
   fingerprint: string
   autoTrusted: boolean

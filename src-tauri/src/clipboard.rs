@@ -1,9 +1,7 @@
 use crate::models::{ClipboardPayload, ClipboardPayloadKind};
-use crate::runtime::RelayRuntime;
-use crate::transfers::{self, LocalFileClipboard};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::transfers::LocalFileClipboard;
+use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
@@ -44,7 +42,7 @@ pub fn packet_from_remote(
 mod desktop {
     use super::{ClipboardMonitorEvent, ClipboardPacket, MAX_IMAGE_BYTES};
     use crate::runtime::RelayRuntime;
-    use crate::transfers::{self, LocalFileClipboard};
+    use crate::transfers;
     use anyhow::{anyhow, bail, Context, Result};
     use arboard::{Clipboard, ImageData};
     use image::{DynamicImage, ImageFormat, RgbaImage};

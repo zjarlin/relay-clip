@@ -97,6 +97,23 @@ struct ActiveTarget {
     socket_addr: SocketAddr,
 }
 
+#[derive(Clone, Copy)]
+enum PairingChangeSource {
+    Manual,
+    Remote,
+    Auto,
+}
+
+impl PairingChangeSource {
+    fn blocked_auto_pair_state(self, paired: bool) -> Option<bool> {
+        match (self, paired) {
+            (Self::Manual, false) | (Self::Remote, false) => Some(true),
+            (Self::Manual, true) | (Self::Remote, true) => Some(false),
+            (Self::Auto, _) => None,
+        }
+    }
+}
+
 impl RelayRuntime {
     pub fn new(app: AppHandle, bridge: RuntimeBridge) -> Result<Self> {
         let (state_path, persistent) = store::load_or_create()?;
@@ -237,21 +254,84 @@ impl RelayRuntime {
             .unwrap_or_default()
     }
 
+    pub fn set_device_remark(
+        &self,
+        device_id: String,
+        remark: Option<String>,
+    ) -> Result<AppStateSnapshot> {
+        if device_id == self.local_device().device_id {
+            bail!("cannot set a remark for this device");
+        }
+
+        let normalized = remark.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+
+        {
+            let mut persistent = self
+                .inner
+                .persistent
+                .write()
+                .map_err(|_| anyhow!("persistent state lock poisoned"))?;
+            if let Some(remark) = normalized {
+                persistent.settings.device_remarks.insert(device_id, remark);
+            } else {
+                persistent.settings.device_remarks.remove(&device_id);
+            }
+            self.persist_locked(&persistent)?;
+        }
+
+        self.emit_devices_updated();
+        self.snapshot()
+    }
+
     pub fn set_device_pairing(&self, device_id: String, paired: bool) -> Result<AppStateSnapshot> {
+        self.set_device_pairing_internal(
+            device_id,
+            paired,
+            PairingChangeSource::Manual,
+            true,
+        )?;
+        self.snapshot()
+    }
+
+    fn set_device_pairing_internal(
+        &self,
+        device_id: String,
+        paired: bool,
+        source: PairingChangeSource,
+        sync_peer: bool,
+    ) -> Result<()> {
         let local_device_id = self.local_device().device_id;
         if device_id == local_device_id {
             bail!("cannot pair this device with itself");
         }
-        let target = self.resolve_active_target(&device_id)?;
-        self.set_device_paired_state(&device_id, paired);
+
+        let target = if sync_peer {
+            match self.resolve_active_target(&device_id) {
+                Ok(target) => Some(target),
+                Err(error) if !paired => {
+                    log::debug!("skipping pair sync because the peer is offline: {error}");
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
+        self.apply_pairing_state(&device_id, paired, source)?;
 
         self.refresh_sync_summary();
         self.emit_devices_updated();
         self.emit_sync_status_changed();
 
-        self.sync_device_pairing_to_peer(target, device_id, paired);
+        if let Some(target) = target {
+            self.sync_device_pairing_to_peer(target, device_id, paired);
+        }
 
-        self.snapshot()
+        Ok(())
     }
 
     pub fn toggle_sync(&self, enabled: bool) -> Result<AppStateSnapshot> {
@@ -924,11 +1004,12 @@ impl RelayRuntime {
         }
 
         self.apply_pairing_route_hint(update, peer_addr.map(|address| address.ip()))?;
-        self.set_device_paired_state(&update.origin_device_id, update.paired);
-        self.refresh_sync_summary();
-        self.emit_devices_updated();
-        self.emit_sync_status_changed();
-        Ok(())
+        self.set_device_pairing_internal(
+            update.origin_device_id.clone(),
+            update.paired,
+            PairingChangeSource::Remote,
+            false,
+        )
     }
 
     fn emit_transfer_ready(&self, job: TransferJob) {
@@ -1291,6 +1372,7 @@ impl RelayRuntime {
             .map(|device| TrustedDevice {
                 device_id: device.device_id.clone(),
                 name: device.name.clone(),
+                remark: self.device_remark_for(&device.device_id),
                 platform: device.platform.clone(),
                 fingerprint: device.fingerprint.clone(),
                 auto_trusted: false,
@@ -1315,7 +1397,10 @@ impl RelayRuntime {
                 .is_active
                 .cmp(&left.is_active)
                 .then(right.is_online.cmp(&left.is_online))
-                .then(left.name.cmp(&right.name))
+                .then(
+                    self.display_device_name(left)
+                        .cmp(&self.display_device_name(right)),
+                )
         });
         devices
     }
@@ -1367,6 +1452,8 @@ impl RelayRuntime {
                     discovery_enabled: false,
                     sync_enabled: false,
                     active_device_ids: Vec::new(),
+                    device_remarks: Default::default(),
+                    blocked_auto_pair_device_ids: Vec::new(),
                     language: AppLanguage::detect_system(),
                 },
                 certificate_der_b64: String::new(),
@@ -1398,6 +1485,64 @@ impl RelayRuntime {
         self.active_device_ids_clone()
             .iter()
             .any(|active_device_id| active_device_id == device_id)
+    }
+
+    fn device_remark_for(&self, device_id: &str) -> Option<String> {
+        self.persistent_clone()
+            .settings
+            .device_remarks
+            .get(device_id)
+            .cloned()
+    }
+
+    fn display_device_name(&self, device: &TrustedDevice) -> String {
+        device
+            .remark
+            .as_deref()
+            .unwrap_or(device.name.as_str())
+            .to_string()
+    }
+
+    fn apply_pairing_state(
+        &self,
+        device_id: &str,
+        paired: bool,
+        source: PairingChangeSource,
+    ) -> Result<()> {
+        self.set_device_paired_state(device_id, paired);
+
+        if let Some(blocked) = source.blocked_auto_pair_state(paired) {
+            self.set_auto_pair_blocked_state(device_id, blocked)?;
+        }
+
+        Ok(())
+    }
+
+    fn set_auto_pair_blocked_state(&self, device_id: &str, blocked: bool) -> Result<()> {
+        let mut persistent = self
+            .inner
+            .persistent
+            .write()
+            .map_err(|_| anyhow!("persistent state lock poisoned"))?;
+        let blocked_ids = &mut persistent.settings.blocked_auto_pair_device_ids;
+
+        if blocked {
+            if !blocked_ids.iter().any(|entry| entry == device_id) {
+                blocked_ids.push(device_id.to_string());
+            }
+        } else {
+            blocked_ids.retain(|entry| entry != device_id);
+        }
+
+        self.persist_locked(&persistent)
+    }
+
+    fn is_auto_pair_blocked(&self, device_id: &str) -> bool {
+        self.persistent_clone()
+            .settings
+            .blocked_auto_pair_device_ids
+            .iter()
+            .any(|blocked_id| blocked_id == device_id)
     }
 
     fn resolve_active_target(&self, device_id: &str) -> Result<ActiveTarget> {
@@ -1458,7 +1603,7 @@ impl RelayRuntime {
             return Ok(false);
         }
 
-        self.set_device_pairing(device_id.to_string(), true)?;
+        self.set_device_pairing_internal(device_id.to_string(), true, PairingChangeSource::Auto, true)?;
         Ok(true)
     }
 
@@ -1467,7 +1612,7 @@ impl RelayRuntime {
             return Ok(false);
         };
 
-        self.set_device_pairing(device_id, true)?;
+        self.set_device_pairing_internal(device_id, true, PairingChangeSource::Auto, true)?;
         Ok(true)
     }
 
@@ -1500,6 +1645,9 @@ impl RelayRuntime {
             .iter()
             .any(|active_device_id| active_device_id == &candidate.device_id)
         {
+            return Ok(None);
+        }
+        if self.is_auto_pair_blocked(&candidate.device_id) {
             return Ok(None);
         }
         if active_target_from_presence(candidate).is_none() {
@@ -1600,6 +1748,10 @@ impl RelayRuntime {
     fn device_name_for(&self, device_id: &str) -> String {
         if device_id == self.local_device().device_id {
             return self.local_device().device_name;
+        }
+
+        if let Some(remark) = self.device_remark_for(device_id) {
+            return remark;
         }
 
         self.inner

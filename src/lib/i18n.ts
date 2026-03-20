@@ -23,6 +23,9 @@ export interface Messages {
   pair: string
   paired: string
   unpair: string
+  deviceRemark: string
+  deviceRemarkPlaceholder: string
+  save: string
   activeNow: string
   online: string
   offline: string
@@ -82,6 +85,9 @@ const english: Messages = {
   pair: 'Pair',
   paired: 'Paired',
   unpair: 'Unpair',
+  deviceRemark: 'Remark',
+  deviceRemarkPlaceholder: 'Add a local note for this device',
+  save: 'Save',
   activeNow: 'Connected',
   online: 'Online',
   offline: 'Offline',
@@ -204,6 +210,9 @@ const chinese: Messages = {
   pair: '配对',
   paired: '已配对',
   unpair: '取消配对',
+  deviceRemark: '备注',
+  deviceRemarkPlaceholder: '给这个设备添加本地备注',
+  save: '保存',
   activeNow: '已连接',
   online: '在线',
   offline: '离线',

@@ -14,6 +14,7 @@ use crate::models::{
     RuntimePermissions, SettingsPatch, TransferJob, TrustedDevice,
 };
 use crate::runtime::RelayRuntime;
+use std::time::Duration;
 use tauri::{Manager, State};
 
 fn to_error_string(error: impl std::fmt::Display) -> String {
@@ -22,7 +23,26 @@ fn to_error_string(error: impl std::fmt::Display) -> String {
 
 #[cfg(target_os = "macos")]
 fn configure_macos_status_bar_app(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
     app.set_dock_visibility(false)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn focus_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    #[cfg(target_os = "macos")]
+    app.show()?;
+
+    if let Some(window) = app.get_webview_window("main") {
+        window.show()?;
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+
     Ok(())
 }
 
@@ -65,6 +85,19 @@ fn set_device_pairing(
 ) -> Result<AppStateSnapshot, String> {
     let snapshot = runtime
         .set_device_pairing(device_id, paired)
+        .map_err(to_error_string)?;
+    let _ = tray::refresh(runtime.app_handle(), &runtime);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn set_device_remark(
+    runtime: State<'_, RelayRuntime>,
+    device_id: String,
+    remark: Option<String>,
+) -> Result<AppStateSnapshot, String> {
+    let snapshot = runtime
+        .set_device_remark(device_id, remark)
         .map_err(to_error_string)?;
     let _ = tray::refresh(runtime.app_handle(), &runtime);
     Ok(snapshot)
@@ -195,6 +228,16 @@ pub fn run() {
             relay.initialize()?;
             app.manage(relay.clone());
             tray::setup(app.handle(), relay)?;
+
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = focus_main_window(&app_handle);
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -213,6 +256,7 @@ pub fn run() {
             get_background_sync_state,
             list_devices,
             set_device_pairing,
+            set_device_remark,
             toggle_sync,
             update_settings,
             list_transfer_jobs,

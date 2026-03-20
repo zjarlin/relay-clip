@@ -181,6 +181,8 @@ fn default_state() -> Result<PersistentState> {
             discovery_enabled: true,
             sync_enabled: true,
             active_device_ids: Vec::new(),
+            device_remarks: BTreeMap::new(),
+            blocked_auto_pair_device_ids: Vec::new(),
             language: default_app_language(),
         },
         certificate_der_b64: STANDARD.encode(cert_der),

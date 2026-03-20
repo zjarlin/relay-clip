@@ -240,6 +240,10 @@ pub struct AppSettings {
     pub sync_enabled: bool,
     #[serde(default)]
     pub active_device_ids: Vec<String>,
+    #[serde(default)]
+    pub device_remarks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub blocked_auto_pair_device_ids: Vec<String>,
     #[serde(default = "default_app_language")]
     pub language: AppLanguage,
 }
@@ -285,6 +289,8 @@ impl ClipboardPayloadKind {
 pub struct TrustedDevice {
     pub device_id: String,
     pub name: String,
+    #[serde(default)]
+    pub remark: Option<String>,
     pub platform: String,
     pub fingerprint: String,
     pub auto_trusted: bool,
